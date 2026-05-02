@@ -52,6 +52,9 @@ const timers = {
   screeningLastRun: null,
 };
 
+// Rate limiter for Telegram /status command: 1 per minute per chat
+const statusRateLimiter = new Map();
+
 function nextRunIn(lastRun, intervalMin) {
   if (!lastRun) return intervalMin * 60;
   const elapsed = (Date.now() - lastRun) / 1000;
@@ -1491,6 +1494,18 @@ async function telegramHandler(msg) {
 
   if (text === "/wallet" || text === "/status") {
     try {
+      // Rate limit /status to 1 per minute per chat
+      if (text === "/status") {
+        const chatId = msg.chat?.id;
+        const now = Date.now();
+        const lastCall = statusRateLimiter.get(chatId);
+        if (lastCall && now - lastCall < 60000) {
+          const waitSec = Math.ceil((60000 - (now - lastCall)) / 1000);
+          await sendMessage(`⏳ /status rate limited — tunggu ${waitSec} detik lagi.`).catch(() => {});
+          return;
+        }
+        statusRateLimiter.set(chatId, now);
+      }
       const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`

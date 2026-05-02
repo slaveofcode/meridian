@@ -197,14 +197,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          response = await client.chat.completions.create({
+          const requestBody = {
             model: usedModel,
             messages,
             tools: getToolsForRole(agentType, goal),
-            tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
-          });
+          };
+          // OpenCode Go (and some providers) don't support tool_choice — skip it entirely
+          const skipToolChoice = process.env.LLM_BASE_URL?.includes("opencode");
+          if (!skipToolChoice) {
+            requestBody.tool_choice = toolChoice;
+          }
+          response = await client.chat.completions.create(requestBody);
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -265,12 +270,21 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        // Hermes sometimes returns null content — pop the empty message and retry once
+        // Hermes / OpenCode Go sometimes returns null content — pop the empty message and retry
         if (!msg.content) {
+          emptyStreak += 1;
+          if (emptyStreak >= 3) {
+            log("agent", "Empty response streak exceeded (3x), aborting");
+            return {
+              content: "Provider returned empty responses repeatedly. The model may not support tool_choice or tools. Consider switching models or disabling tool_choice.",
+              userMessage: goal,
+            };
+          }
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          log("agent", `Empty response, retrying... (${emptyStreak}/3)`);
           continue;
         }
+        emptyStreak = 0; // reset on valid content
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
           messages.pop();
