@@ -4,6 +4,48 @@
 
 ---
 
+## 📖 For Newbies: What Is This?
+
+**Meridian** adalah robot trading otomatis khusus untuk yang mau jadi **Liquidity Provider (LP)** di blockchain **Solana**.
+
+### Apa itu Liquidity Provider (LP)?
+Bayangkan kamu punya dua jenis uang: uang asli (SOL) dan uang digital (token kayak USDC, BONK, dll). Kamu naruh keduanya ke dalam "kolam" (pool) di bursa terdesentralisasi. Orang-orang yang mau tukar uang mereka menggunakan kolam ini, dan kamu dapat **fee** (biaya transaksi) sebagai imbalan.
+
+### Apa itu DLMM?
+DLMM = **Dynamic Liquidity Market Maker**. Ini teknologi dari **Meteora** yang bikin kolam liquidity jadi lebih efisien:
+- Kamu bisa pilih range harga tertentu (misal: harga token X antara $1-$2)
+- Kalau harga token ada di range kamu, kamu dapat fee
+- Kalau harga keluar dari range kamu, posisi kamu "out of range" → gak dapat fee lagi
+
+### Kenapa Butuh Agent Otomatis?
+Jadi LP secara manual itu **ribet dan capek**:
+- Harus pantau harga token 24/7
+- Harus hitung fee/TVL, volume, organic score (apakah transaksi asli atau bot)
+- Harus putusin kapan buka posisi, kapan tutup, kapan pindah ke pool lain
+- Salah range = duit idle, rugi, atau kena impermanent loss
+
+**Meridian** ngelakuin semua itu otomatis pakai **AI (LLM)**:
+1. **Screening** — tiap 5 menit, AI nyari pool terbaik di seluruh Meteora
+2. **Deploy** — kalau nemu pool bagus, AI otomatis naruh duitmu ke situ
+3. **Monitor** — tiap 30 detik, AI cek apakah posisimu masih untung, masih in-range, atau harus ditutup
+4. **Act** — AI bisa claim fee, close posisi, atau redeploy ke pool lain
+
+### Konsep ReAct Agent
+Meridian pakai pola **ReAct** (Reason + Act):
+- AI "berpikir" dulu lihat data (harga, fee, PnL, range)
+- AI pilih "tool" yang mau dipakai (cek posisi, deploy, close, dll)
+- AI eksekusi, lalu evaluasi hasilnya
+- Proses ini berulang tiap siklus
+
+### Screening vs Management
+Ada 2 agent yang jalan paralel:
+| Agent | Interval | Tugas |
+|---|---|---|
+| **Hunter** (Screening) | Tiap 5 menit | Cari pool baru yang potensial |
+| **Healer** (Management) | Tiap 30 detik | Pantau & manage posisi yang udah terbuka |
+
+---
+
 ## What it does
 
 - **Screens pools** — continuously scans Meteora DLMM pools against configurable thresholds (fee/TVL ratio, organic score, holder count, market cap, bin step, etc.) to surface high-quality opportunities
@@ -39,7 +81,7 @@ Agents are powered via **OpenRouter** and can be swapped for any compatible mode
 ## Requirements
 
 - Node.js 18+
-- [OpenRouter](https://openrouter.ai) API key
+- LLM API key (OpenRouter **or** OpenCode Go)
 - Solana wallet (base58 private key)
 - Telegram bot token (optional, for notifications)
 
@@ -63,15 +105,20 @@ npm install
 **3. Create `.env`**
 
 ```env
-OPENROUTER_API_KEY=sk-or-...
+# LLM Provider (pick one)
+OPENROUTER_API_KEY=sk-or-...               # for OpenRouter
+LLM_BASE_URL=https://opencode.ai/zen/go/v1 # for OpenCode Go
+LLM_API_KEY=sk-...                         # for OpenCode Go
+
 WALLET_PRIVATE_KEY=your_base58_private_key
-HELIUS_API_KEY=your_helius_key         # for wallet balance lookups
-TELEGRAM_BOT_TOKEN=123456:ABC...       # optional
-LPAGENT_API_KEY=lpagent_...            # optional, for study_top_lpers / get_top_lpers
-DRY_RUN=true                           # set false for live trading
+HELIUS_API_KEY=your_helius_key             # for wallet balance lookups
+TELEGRAM_BOT_TOKEN=123456:ABC...           # optional
+LPAGENT_API_KEY=lpagent_...                # optional, for study_top_lpers
+DRY_RUN=true                               # set false for live trading
 ```
 
 > **RPC**: defaults to `https://pump.helius-rpc.com` (no key needed). Override with `RPC_URL=` in `.env`.
+> **OpenCode Go**: set `LLM_BASE_URL` and `LLM_API_KEY` instead of `OPENROUTER_API_KEY`. Supports models like `kimi-k2.6`.
 
 Optional encrypted `.env` flow:
 
@@ -92,11 +139,55 @@ cp user-config.example.json user-config.json
 **5. Run**
 
 ```bash
-npm run dev    # dry run — no on-chain transactions
-npm start      # live mode
+# Dry run (safe — no on-chain transactions)
+npm run dev
+
+# Live mode (use PM2 for production)
+pm2 start index.js --name meridian
 ```
 
+> ⚠️ `npm run dev` forces `DRY_RUN=true` via package.json script. For live trading, run `node index.js` directly or use PM2.
+
 On startup Meridian fetches your wallet balance, open positions, and the top pool candidates, then begins autonomous cycles immediately.
+
+---
+
+## Fork Custom Patches (Experimental Branch)
+
+This fork (`develop` branch) includes stability patches and tuning applied on top of upstream `experimental`:
+
+### Code Patches
+
+| File | Patch | Reason |
+|---|---|---|
+| `agent.js` | Skip `tool_choice` parameter when `LLM_BASE_URL` contains `opencode.ai` | OpenCode Go returns 400 on unsupported `tool_choice` field |
+| `agent.js` | Add `emptyStreak` counter — abort after 3 consecutive empty LLM responses | Prevents infinite loop when LLM returns blank / tool-less responses |
+| `index.js` | Add rate limiter for Telegram `/status` command — 1x per minute per chat | Prevents spam & reduces LLM API cost |
+
+### Recommended Config Tuning
+
+The following values are battle-tested for small-balance wallets (~0.5–1 SOL):
+
+| Field | Default | Tuned | Notes |
+|---|---|---|---|
+| `deployAmountSol` | `0.5` | `0.1` | Meteora minimum; spread capital thinner |
+| `maxPositions` | `3` | `2` | Focus capital, less risk |
+| `minSolToOpen` | `0.07` | `0.15` | Reserve buffer for gas + rebalance |
+| `gasReserve` | `0.2` | `0.03` | Lowered for small wallets |
+| `managementIntervalMin` | `10` | `0.5` | 30-second management cycles |
+| `screeningIntervalMin` | `30` | `5` | Aggressive 5-minute screening |
+| `stopLossPct` | `-50` | `-30` | Cut losses faster |
+| `takeProfitPct` | `5` | `8` | Let fees compound longer |
+| `trailingTriggerPct` | `3` | `3` | Start trailing at +3% |
+| `trailingDropPct` | `1.5` | `1.5` | Sensitive exit on pullback |
+| `minFeeActiveTvlRatio` | `0.05` | `0.01` | More pool eligibility |
+| `minFeePerTvl24h` | `7` | `4` | More pool eligibility |
+| `outOfRangeWaitMinutes` | `30` | `15` | Faster OOR reaction |
+| `positionSizePct` | — | `0.35` | Position sizing ratio |
+| `binsBelow` | — | `69` | DLMM bin range |
+| `lpAgentRelayEnabled` | `false` | `true` | Route PnL / Top LP via Agent Meridian (free, no LPAgent key needed) |
+| `useDiscordSignals` | `false` | `true` | Merge Discord signal candidates into screening pool |
+| `discordSignalMode` | — | `"merge"` | Add Discord signals as extra candidates, not overrides |
 
 ---
 
