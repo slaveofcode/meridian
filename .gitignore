@@ -9,6 +9,7 @@ node_modules/
 
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
+user-config.backup.json
 gmgn-config.json
 
 # Runtime state (position tracking, lessons — user-specific)
@@ -31,6 +32,9 @@ logs/
 # Dev context
 context.md
 docs/
+
+# GMGN keys
+*.pem
 
 # Test files
 test-*.js
