@@ -11,7 +11,7 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
-import { config, computeDeployAmount } from "../config.js";
+import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -27,6 +27,20 @@ import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
+import {
+  agentMeridianJson,
+  agentMeridianJsonOnce,
+  getAgentMeridianHeaders,
+  getAgentMeridianBase,
+  shouldUseLpAgentRelay,
+  shouldUseLpAgentRelayForDeploy,
+  isRetryableMeridianError,
+  // backward-compat aliases (callers still use old names)
+  meridianJson,
+  meridianJsonOnce,
+  getMeridianHeaders,
+  getMeridianApiBase,
+} from "./agent-meridian.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -93,129 +107,6 @@ function getWallet() {
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
-}
-
-function getMeridianApiBase() {
-  return String(config.api.url || "https://api.agentmeridian.xyz/api").replace(/\/+$/, "");
-}
-
-function getMeridianHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (config.api.publicApiKey) {
-    headers["x-api-key"] = config.api.publicApiKey;
-  }
-  return headers;
-}
-
-function shouldUseLpAgentRelay() {
-  return !!config.api.lpAgentRelayEnabled;
-}
-
-function shouldUseLpAgentRelayForDeploy() {
-  return false;
-}
-
-async function meridianJson(pathname, options = {}) {
-  const { retry, ...fetchOptions } = options;
-  if (!retry) {
-    return meridianJsonOnce(pathname, fetchOptions);
-  }
-
-  const maxElapsedMs = Number(retry.maxElapsedMs || 30_000);
-  const maxAttempts = Number(retry.maxAttempts || 10);
-  const startedAt = Date.now();
-  let attempt = 0;
-  let lastError = null;
-
-  while (Date.now() - startedAt < maxElapsedMs && attempt < maxAttempts) {
-    const elapsedMs = Date.now() - startedAt;
-    const remainingMs = Math.max(1, maxElapsedMs - elapsedMs);
-    try {
-      return await meridianJsonOnce(
-        pathname,
-        fetchOptions,
-        Math.min(Number(retry.perAttemptTimeoutMs || 10_000), remainingMs),
-      );
-    } catch (error) {
-      lastError = error;
-      if (!isRetryableMeridianError(error) || attempt >= maxAttempts - 1) {
-        throw error;
-      }
-      const waitMs = Math.min(meridianRetryDelayMs(error, attempt), Math.max(0, remainingMs - 1));
-      if (waitMs <= 0) break;
-      await sleep(waitMs);
-      attempt += 1;
-    }
-  }
-
-  throw lastError || new Error(`${pathname} retry budget exhausted`);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isRetryableMeridianStatus(status) {
-  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
-}
-
-function isRetryableMeridianError(error) {
-  if (isRetryableMeridianStatus(Number(error?.status || 0))) return true;
-  const name = String(error?.name || "");
-  const message = String(error?.message || "").toLowerCase();
-  return name === "AbortError" ||
-    message.includes("aborted") ||
-    message.includes("fetch failed") ||
-    message.includes("network");
-}
-
-function meridianRetryDelayMs(error, attempt) {
-  const retryAfter = Number(error?.retryAfter);
-  if (Number.isFinite(retryAfter) && retryAfter > 0) {
-    return Math.min(retryAfter * 1000, 10_000);
-  }
-  return Math.min(500 * 2 ** attempt, 5_000);
-}
-
-async function meridianFetchWithTimeout(url, options, timeoutMs) {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return fetch(url, options);
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const signal = options.signal;
-  const abortFromParent = () => controller.abort();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener("abort", abortFromParent, { once: true });
-  }
-
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener("abort", abortFromParent);
-  }
-}
-
-async function meridianJsonOnce(pathname, options = {}, timeoutMs = null) {
-  const res = await meridianFetchWithTimeout(`${getMeridianApiBase()}${pathname}`, options, timeoutMs);
-  const text = await res.text().catch(() => "");
-  let payload = {};
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = { raw: text };
-  }
-  if (!res.ok) {
-    const error = new Error(payload?.error || `${pathname} ${res.status}`);
-    error.status = res.status;
-    error.payload = payload;
-    error.retryAfter = res.headers.get("retry-after");
-    throw error;
-  }
-  return payload;
 }
 
 function signSerializedTransaction(serialized, wallet) {
@@ -580,8 +471,15 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
-  let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+  let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
+
+  const parsedVolatility = volatility == null ? null : Number(volatility);
+  const normalizedVolatility = parsedVolatility != null && Number.isFinite(parsedVolatility) ? parsedVolatility : null;
+
+  if (volatility != null && (normalizedVolatility == null || normalizedVolatility <= 0)) {
+    throw new Error(`Invalid volatility ${volatility} — refusing deploy because the volatility feed is unusable.`);
+  }
 
   if (isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
@@ -619,23 +517,16 @@ export async function deployPosition({
     activeBinsAbove = Math.max(0, upperBinId - activeBin.binId);
   }
 
-  if (process.env.DRY_RUN === "true") {
-    const totalBins = activeBinsBelow + activeBinsAbove;
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: amount_x || 0,
-        amount_y: amount_y || amount_sol || 0,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
+  activeBinsBelow = Number(activeBinsBelow);
+  activeBinsAbove = Number(activeBinsAbove);
+  if (!Number.isFinite(activeBinsBelow) || !Number.isFinite(activeBinsAbove)) {
+    throw new Error("Invalid bin range: bins_below and bins_above must be valid numbers.");
+  }
+  if (activeBinsBelow < 0 || activeBinsAbove < 0) {
+    throw new Error("Invalid bin range: bins_below and bins_above cannot be negative.");
+  }
+  if (!Number.isInteger(activeBinsBelow) || !Number.isInteger(activeBinsAbove)) {
+    throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
   }
 
   const strategyMap = {
@@ -655,8 +546,25 @@ export async function deployPosition({
     amount_y == null && amount_sol == null
       ? computeDeployAmount((await getWalletBalances()).sol)
       : 0;
-  const finalAmountY = amount_y ?? amount_sol ?? fallbackAmountY;
-  const finalAmountX = amount_x ?? 0;
+  const finalAmountY = Number(amount_y ?? amount_sol ?? fallbackAmountY);
+  const finalAmountX = Number(amount_x ?? 0);
+
+  if (!Number.isFinite(finalAmountY) || !Number.isFinite(finalAmountX) || finalAmountY < 0 || finalAmountX < 0) {
+    throw new Error(
+      "Invalid deploy amount: amount_x and amount_y must be valid non-negative numbers.",
+    );
+  }
+  if (finalAmountX > 0) {
+    throw new Error(
+      "Unsupported deploy amount: this agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
+    );
+  }
+  if (finalAmountY <= 0) {
+    throw new Error(
+      "Invalid deploy amount: provide a positive amount_y/amount_sol.",
+    );
+  }
+
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
@@ -668,6 +576,32 @@ export async function deployPosition({
   }
   const totalBins = activeBinsBelow + activeBinsAbove;
   const isWideRange = totalBins > 69;
+
+  const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+  if (totalBins < minBinsBelow) {
+    throw new Error(
+      `Invalid deploy range: total bins ${totalBins} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+    );
+  }
+
+  if (process.env.DRY_RUN === "true") {
+    return {
+      dry_run: true,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: totalBins > 69,
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
+
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
 

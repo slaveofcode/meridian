@@ -20,7 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -66,6 +66,71 @@ function poolDetailBinStep(pool) {
 
 function poolDetailFeeActiveTvlRatio(pool) {
   return numberOrNull(pool?.fee_active_tvl_ratio);
+}
+
+function poolDetailVolatility(pool) {
+  return numberOrNull(pool?.volatility);
+}
+
+function coerceBoolean(value, key) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  throw new Error(`${key} must be true or false`);
+}
+
+function coerceFiniteNumber(value, key) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error(`${key} must be a finite number`);
+  return n;
+}
+
+function coerceString(value, key) {
+  if (typeof value !== "string") throw new Error(`${key} must be a string`);
+  return value.trim();
+}
+
+function coerceStringArray(value, key) {
+  if (!Array.isArray(value)) throw new Error(`${key} must be an array of strings`);
+  return value.map((entry) => coerceString(entry, key)).filter(Boolean);
+}
+
+function normalizeConfigValue(key, value) {
+  const booleanKeys = new Set([
+    "excludeHighSupplyConcentration",
+    "useDiscordSignals",
+    "avoidPvpSymbols",
+    "blockPvpSymbols",
+    "autoSwapAfterClaim",
+    "trailingTakeProfit",
+    "solMode",
+    "darwinEnabled",
+    "lpAgentRelayEnabled",
+  ]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const stringKeys = new Set([
+    "timeframe",
+    "category",
+    "discordSignalMode",
+    "strategy",
+    "managementModel",
+    "screeningModel",
+    "generalModel",
+    "hiveMindUrl",
+    "hiveMindApiKey",
+    "agentId",
+    "hiveMindPullMode",
+    "publicApiKey",
+    "agentMeridianApiUrl",
+  ]);
+  if (value === null) return null;
+  if (booleanKeys.has(key)) return coerceBoolean(value, key);
+  if (arrayKeys.has(key)) return coerceStringArray(value, key);
+  if (stringKeys.has(key)) return coerceString(value, key);
+  return coerceFiniteNumber(value, key);
 }
 
 async function fetchFreshPoolDetail(poolAddress) {
@@ -138,6 +203,14 @@ async function validateDeployPoolThresholds(args) {
     return {
       pass: false,
       reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+    };
+  }
+
+  const volatility = poolDetailVolatility(detail);
+  if (volatility == null || volatility <= 0) {
+    return {
+      pass: false,
+      reason: `Pool volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
     };
   }
 
@@ -316,6 +389,7 @@ const toolMap = {
       strategy:     ["strategy", "strategy"],
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
+      defaultBinsBelow: ["strategy", "defaultBinsBelow"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -393,10 +467,25 @@ const toolMap = {
       Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
     );
 
+    const STRATEGY_BIN_KEYS = new Set(["binsBelow", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow"]);
     for (const [key, val] of Object.entries(changes)) {
       const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
       if (!match) { unknown.push(key); continue; }
-      applied[match[0]] = val;
+      try {
+        let normalizedVal = val;
+        if (STRATEGY_BIN_KEYS.has(match[0])) {
+          const numericVal = Number(val);
+          if (!Number.isFinite(numericVal)) {
+            throw new Error(`${match[0]} must be a finite number`);
+          }
+          normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
+        } else {
+          normalizedVal = normalizeConfigValue(match[0], val);
+        }
+        applied[match[0]] = normalizedVal;
+      } catch (error) {
+        return { success: false, error: error.message, key: match[0], reason };
+      }
     }
 
     if (Object.keys(applied).length === 0) {
@@ -629,6 +718,18 @@ async function runSafetyChecks(name, args) {
         };
       }
 
+      // Reject tiny-range deploys
+      const binsBelow = args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
+      const binsAbove = args.bins_above ?? 0;
+      const totalBins = Number(binsBelow) + Number(binsAbove);
+      const minBins = Math.max(MIN_SAFE_BINS_BELOW, config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW);
+      if (Number.isFinite(totalBins) && totalBins < minBins) {
+        return {
+          pass: false,
+          reason: `Total bins ${totalBins} below minimum ${minBins}. Refusing 1-bin/tiny-range deploy.`,
+        };
+      }
+
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
       const positions = await getMyPositions({ force: true });
       if (positions.total_positions >= config.risk.maxPositions) {
@@ -661,7 +762,20 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check amount limits
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
+      const amountY = Number(args.amount_y ?? args.amount_sol ?? 0);
+      const amountX = Number(args.amount_x ?? 0);
+      if (!Number.isFinite(amountY)) {
+        return {
+          pass: false,
+          reason: `Invalid amount_y: ${args.amount_y}. Must be a valid number.`,
+        };
+      }
+      if (amountX > 0) {
+        return {
+          pass: false,
+          reason: `amount_x=${amountX} is not supported. Single-side SOL deploys only (amount_y only).`,
+        };
+      }
       if (amountY <= 0) {
         return {
           pass: false,

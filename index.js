@@ -511,6 +511,36 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
 
+    if (passing.length === 1) {
+      const skipReason = getLoneCandidateSkipReason(passing[0]);
+      if (skipReason) {
+        const candidateName = passing[0].pool.name || "unknown";
+        screenReport = [
+          "⛔ NO DEPLOY",
+          "",
+          "Cycle finished with no valid entry.",
+          "",
+          "BEST LOOKING CANDIDATE",
+          candidateName,
+          "",
+          "WHY SKIPPED",
+          `Only one candidate survived filtering, but it was not worth deploying: ${skipReason}.`,
+          "",
+          "REJECTED",
+          `- ${candidateName}: ${skipReason}`,
+        ].join("\n");
+        appendDecision({
+          type: "no_deploy",
+          actor: "SCREENER",
+          summary: "Single candidate skipped",
+          reason: skipReason,
+          pool: passing[0].pool.pool,
+          pool_name: candidateName,
+        });
+        return screenReport;
+      }
+    }
+
     if (passing.length <= 1 && gmgnStageCounts) {
       const funnelBlock = buildGmgnFunnelReport(gmgnStageCounts, gmgnAllFiltered, { fromStage: 2 });
       if (funnelBlock) log("screening", `GMGN funnel (sparse):\n${funnelBlock}`);
@@ -604,6 +634,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
 
+    let deployAttempted = false;
+    let deploySucceeded = false;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -674,8 +706,17 @@ IMPORTANT:
 - Never write "unknown" for OKX. Use real values, omit missing fields, or write exactly "OKX: unavailable".
 - Keep the whole report compact and highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        onToolStart: async ({ name }) => {
+          if (name === "deploy_position") deployAttempted = true;
+          await liveMessage?.toolStart(name);
+        },
+        onToolFinish: async ({ name, result, success }) => {
+          if (name === "deploy_position") {
+            deployAttempted = true;
+            deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+          }
+          await liveMessage?.toolFinish(name, result, success);
+        },
       });
     const funnelAppend = buildGmgnFunnelReport(gmgnStageCounts, gmgnAllFiltered, { fromStage: 2 });
     screenReport = funnelAppend ? `${content}\n\n─────────────\n${funnelAppend}` : content;
@@ -684,6 +725,13 @@ IMPORTANT:
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
+        reason: stripThink(content).slice(0, 500),
+      });
+    } else if (!deploySucceeded) {
+      appendDecision({
+        type: "no_deploy",
+        actor: "SCREENER",
+        summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(content).slice(0, 500),
       });
     }
@@ -901,6 +949,30 @@ function computeBinsBelow(volatility) {
   const lo = config.strategy.minBinsBelow;
   const hi = config.strategy.maxBinsBelow;
   return Math.max(lo, Math.min(hi, Math.round(lo + ((Number(volatility) || 0) / 5) * (hi - lo))));
+}
+
+function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
+  if (!pool) return "missing candidate data";
+  const smartWalletCount = Math.max(sw?.in_pool?.length ?? 0, Number(pool.gmgn_smart_wallets ?? 0) || 0);
+  const tokenInfo = ti || {};
+  const hasNarrative = !!n?.narrative;
+  const globalFeesSol = Number(tokenInfo.global_fees_sol ?? pool.gmgn_total_fee_sol);
+  const top10Pct = Number(tokenInfo.audit?.top_holders_pct ?? pool.gmgn_token_info_top10_pct ?? pool.gmgn_top10_holder_pct);
+  const botPct = Number(tokenInfo.audit?.bot_holders_pct ?? pool.gmgn_bot_degen_pct);
+  if (pool.is_wash) return "wash trading was flagged";
+  if (pool.is_rugpull && smartWalletCount === 0) return "rugpull risk was flagged and no smart wallets offset it";
+  if (pool.is_pvp && smartWalletCount === 0) return "PVP symbol conflict and no smart-wallet confirmation";
+  if (Number.isFinite(globalFeesSol) && globalFeesSol < config.screening.minTokenFeesSol) {
+    return `token fees ${globalFeesSol} SOL below minimum ${config.screening.minTokenFeesSol} SOL`;
+  }
+  if (Number.isFinite(top10Pct) && top10Pct > config.screening.maxTop10Pct) {
+    return `top10 concentration ${top10Pct}% above maximum ${config.screening.maxTop10Pct}%`;
+  }
+  if (Number.isFinite(botPct) && botPct > config.screening.maxBotHoldersPct) {
+    return `bot holders ${botPct}% above maximum ${config.screening.maxBotHoldersPct}%`;
+  }
+  if (!hasNarrative && smartWalletCount === 0) return "only candidate has no narrative and no smart-wallet confirmation";
+  return null;
 }
 
 // ═══════════════════════════════════════════
@@ -1156,6 +1228,7 @@ function renderSettingsMenu(page = "main") {
       ],
       inputButton("minBinsBelow", "Min bins"),
       inputButton("maxBinsBelow", "Max bins"),
+      inputButton("defaultBinsBelow", "Default bins"),
     ];
   } else if (page === "gmgn") {
     rows = [
@@ -1301,6 +1374,7 @@ async function applySettingsMenuCallback(msg) {
     if (key === "repeatDeployCooldownTriggerCount") value = Math.max(1, Math.round(value));
     if (key === "repeatDeployCooldownHours") value = Math.max(0, Math.round(value));
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
+    if (["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)) value = Math.max(35, Math.round(value));
     if (["deployAmountSol", "gasReserve", "maxDeployAmount"].includes(key)) value = Math.max(0, value);
   } else if (action === "set") {
     value = normalizeMenuValue(key, parts.slice(3).join(":"));
@@ -1323,7 +1397,7 @@ async function applySettingsMenuCallback(msg) {
       ? "gmgn"
       : key.startsWith("indicator") || key === "chartIndicatorsEnabled" || key === "rsiLength" || key === "requireAllIntervals"
         ? "indicators"
-        : ["minBinsBelow", "maxBinsBelow"].includes(key)
+        : ["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)
           ? "strategy"
           : ["useDiscordSignals", "blockPvpSymbols", "managementIntervalMin", "screeningIntervalMin", "screeningSource", "gmgnRequireKol"].includes(key)
             ? "screen"
