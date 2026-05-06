@@ -34,3 +34,4 @@ docs/
 
 # Test files
 test-*.js
+node_modules/
