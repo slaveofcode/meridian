@@ -933,6 +933,7 @@ function buildGmgnFunnelReport(stageCounts, allFiltered = [], { fromStage = 1 } 
   const funnel = `GMGN funnel: ranked=${sc.ranked ?? "?"} → S1=${sc.s1 ?? "?"} → S2=${sc.s2 ?? "?"} → S3=${sc.s3 ?? "?"} → S4=${sc.s4 ?? "?"} → final=${sc.s5 ?? "?"}`;
   const byStage = {};
   for (const f of allFiltered) {
+    if (f.stage == null) continue;
     if (f.stage < fromStage) continue;
     const key = `s${f.stage}`;
     if (!byStage[key]) byStage[key] = [];
