@@ -148,6 +148,11 @@ const { values: flags } = parseArgs({
     "dry-run":    { type: "boolean" },
     "silent":     { type: "boolean" },
     limit:        { type: "string" },
+    query:        { type: "string" },
+    mint:         { type: "string" },
+    wallet:       { type: "string" },
+    reason:       { type: "string" },
+    timeframe:    { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -346,6 +351,147 @@ switch (subcommand) {
     const { startCronJobs } = await import("./index.js");
     process.stderr.write("[meridian] Starting autonomous agent...\n");
     startCronJobs();
+    break;
+  }
+
+  // ── token-info ──────────────────────────────────────────────────
+  case "token-info": {
+    const query = flags.query || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-info");
+    if (!query) die("Usage: meridian token-info --query <mint_or_symbol>");
+    const { getTokenInfo } = await import("./tools/token.js");
+    out(await getTokenInfo({ query }));
+    break;
+  }
+
+  // ── token-holders ─────────────────────────────────────────────
+  case "token-holders": {
+    const mint = flags.mint || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-holders");
+    if (!mint) die("Usage: meridian token-holders --mint <addr>");
+    const { getTokenHolders } = await import("./tools/token.js");
+    const limit = flags.limit ? parseInt(flags.limit) : 20;
+    out(await getTokenHolders({ mint, limit }));
+    break;
+  }
+
+  // ── token-narrative ───────────────────────────────────────────
+  case "token-narrative": {
+    const mint = flags.mint || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-narrative");
+    if (!mint) die("Usage: meridian token-narrative --mint <addr>");
+    const { getTokenNarrative } = await import("./tools/token.js");
+    out(await getTokenNarrative({ mint }));
+    break;
+  }
+
+  // ── pool-detail ───────────────────────────────────────────────
+  case "pool-detail": {
+    if (!flags.pool) die("Usage: meridian pool-detail --pool <addr> [--timeframe 5m]");
+    const { getPoolDetail } = await import("./tools/screening.js");
+    out(await getPoolDetail({ pool_address: flags.pool, timeframe: flags.timeframe || "5m" }));
+    break;
+  }
+
+  // ── search-pools ──────────────────────────────────────────────
+  case "search-pools": {
+    const query = flags.query || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "search-pools");
+    if (!query) die("Usage: meridian search-pools --query <name_or_symbol>");
+    const { searchPools } = await import("./tools/dlmm.js");
+    const limit = flags.limit ? parseInt(flags.limit) : 10;
+    out(await searchPools({ query, limit }));
+    break;
+  }
+
+  // ── active-bin ────────────────────────────────────────────────
+  case "active-bin": {
+    if (!flags.pool) die("Usage: meridian active-bin --pool <addr>");
+    const { getActiveBin } = await import("./tools/dlmm.js");
+    out(await getActiveBin({ pool_address: flags.pool }));
+    break;
+  }
+
+  // ── wallet-positions ──────────────────────────────────────────
+  case "wallet-positions": {
+    const wallet = flags.wallet || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "wallet-positions");
+    if (!wallet) die("Usage: meridian wallet-positions --wallet <addr>");
+    const { getWalletPositions } = await import("./tools/dlmm.js");
+    out(await getWalletPositions({ wallet_address: wallet }));
+    break;
+  }
+
+  // ── study ────────────────────────────────────────────────────────
+  case "study": {
+    if (!flags.pool) die("Usage: meridian study --pool <addr> [--limit 4]");
+    const { studyTopLPers } = await import("./tools/study.js");
+    const limit = flags.limit ? parseInt(flags.limit) : 4;
+    out(await studyTopLPers({ pool_address: flags.pool, limit }));
+    break;
+  }
+
+  // ── lessons ──────────────────────────────────────────────────────
+  case "lessons": {
+    if (sub2 === "add") {
+      const text = argv.filter(a => !a.startsWith("-")).slice(2).join(" ");
+      if (!text) die("Usage: meridian lessons add <text>");
+      const { addLesson } = await import("./lessons.js");
+      addLesson(text, [], { pinned: false, role: null });
+      out({ saved: true, rule: text, outcome: "manual", role: null });
+    } else {
+      const { listLessons } = await import("./lessons.js");
+      const limit = flags.limit ? parseInt(flags.limit) : 50;
+      out(listLessons({ limit }));
+    }
+    break;
+  }
+
+  // ── pool-memory ──────────────────────────────────────────────────
+  case "pool-memory": {
+    if (!flags.pool) die("Usage: meridian pool-memory --pool <addr>");
+    const { getPoolMemory } = await import("./pool-memory.js");
+    out(getPoolMemory({ pool_address: flags.pool }));
+    break;
+  }
+
+  // ── evolve ───────────────────────────────────────────────────────
+  case "evolve": {
+    const { config } = await import("./config.js");
+    const { evolveThresholds } = await import("./lessons.js");
+    const fs2 = await import("fs");
+    const lessonsFile = "./lessons.json";
+    let perfData = [];
+    if (fs2.existsSync(lessonsFile)) {
+      try { perfData = JSON.parse(fs2.readFileSync(lessonsFile, "utf8")).performance || []; } catch { /* no data */ }
+    }
+    const result = evolveThresholds(perfData, config);
+    if (!result) {
+      out({ evolved: false, reason: `Need at least 5 closed positions (have ${perfData.length})` });
+    } else {
+      out({ evolved: Object.keys(result.changes).length > 0, changes: result.changes, rationale: result.rationale });
+    }
+    break;
+  }
+
+  // ── blacklist ────────────────────────────────────────────────────
+  case "blacklist": {
+    if (sub2 === "add") {
+      if (!flags.mint) die("Usage: meridian blacklist add --mint <addr> --reason <text>");
+      if (!flags.reason) die("--reason is required");
+      const { addToBlacklist } = await import("./token-blacklist.js");
+      out(addToBlacklist({ mint: flags.mint, reason: flags.reason }));
+    } else if (sub2 === "list" || !sub2) {
+      const { listBlacklist } = await import("./token-blacklist.js");
+      out(listBlacklist());
+    } else {
+      die(`Unknown blacklist subcommand: ${sub2}. Use: add, list`);
+    }
+    break;
+  }
+
+  // ── performance ──────────────────────────────────────────────────
+  case "performance": {
+    const { getPerformanceHistory, getPerformanceSummary } = await import("./lessons.js");
+    const limit = flags.limit ? parseInt(flags.limit) : 200;
+    const history = getPerformanceHistory({ hours: 999999, limit });
+    const summary = getPerformanceSummary();
+    out({ summary, ...history });
     break;
   }
 
