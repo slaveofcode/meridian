@@ -187,7 +187,7 @@ async function maybeRunMissedBriefing() {
 
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
-  if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
+  if (_cronTasks._pnlPollTimer) clearTimeout(_cronTasks._pnlPollTimer);
   _cronTasks = [];
 }
 
@@ -753,9 +753,19 @@ IMPORTANT:
 export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+  // Dynamic management cycle: runs every minute, but only executes if enough time has passed
+  // - With positions open: uses fastManagementIntervalMin (default 1m)
+  // - Without positions: uses managementIntervalMin (default 3m)
+  const mgmtTask = cron.schedule(`* * * * *`, async () => {
     if (_managementBusy) return;
-    timers.managementLastRun = Date.now();
+    const now = Date.now();
+    const intervalMs = _pnlHasOpenPositions
+      ? config.schedule.fastManagementIntervalMin * 60 * 1000
+      : config.schedule.managementIntervalMin * 60 * 1000;
+    if (now - timers.managementLastRun < intervalMs) return;
+    timers.managementLastRun = now;
+    const mode = _pnlHasOpenPositions ? `fast (${config.schedule.fastManagementIntervalMin}m)` : `normal (${config.schedule.managementIntervalMin}m)`;
+    log("cron", `[Mgmt cycle] ${mode} — ${_pnlHasOpenPositions ? "ada posisi" : "idle"}`);
     await runManagementCycle();
   });
 
@@ -788,14 +798,61 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
+  // Lightweight PnL poller — updates trailing TP state between management cycles, no LLM
+  // Dynamically adjusts interval & cooldown: faster when positions are open, normal when idle
   let _pnlPollBusy = false;
-  const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+  let _pnlHasOpenPositions = false;
+  const PNL_POLL_NORMAL_MS = 30_000;
+
+  function getPnlCooldownMs() {
+    return _pnlHasOpenPositions
+      ? config.schedule.fastPnlCooldownSec * 1000
+      : config.schedule.managementIntervalMin * 60 * 1000;
+  }
+
+  function getPnlPollIntervalMs() {
+    return _pnlHasOpenPositions
+      ? config.schedule.fastPnlCooldownSec * 1000
+      : PNL_POLL_NORMAL_MS;
+  }
+
+  let _pnlPollTimer;
+  let _lastForceFetch = 0; // rate-limit: only force-fetch API every fastPnlCooldownSec
+
+  function schedulePnlPoll() {
+    const intervalMs = getPnlPollIntervalMs();
+    _pnlPollTimer = setTimeout(pnlPollTick, intervalMs);
+    _cronTasks._pnlPollTimer = _pnlPollTimer;
+  }
+
+  async function pnlPollTick() {
+    if (_managementBusy || _screeningBusy || _pnlPollBusy) {
+      schedulePnlPoll();
+      return;
+    }
     _pnlPollBusy = true;
     try {
-      const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
-      if (!result?.positions?.length) return;
+      // Rate-limit aware fetch: only force (API call) every fastPnlCooldownSec,
+      // otherwise use cache to avoid hitting LP Agent / relay rate limits
+      const now = Date.now();
+      const cooldownMs = getPnlCooldownMs();
+      const canForceFetch = (now - _lastForceFetch) >= cooldownMs;
+      const result = await getMyPositions({ force: canForceFetch, silent: true }).catch(() => null);
+      if (canForceFetch) _lastForceFetch = now;
+      const hasPositions = !!result?.positions?.length;
+
+      // Log mode switch for observability
+      if (hasPositions !== _pnlHasOpenPositions) {
+        _pnlHasOpenPositions = hasPositions;
+        if (hasPositions) {
+          log("cron", `[PnL poll] FAST mode aktif (${config.schedule.fastPnlCooldownSec}s interval/cooldown) — ${result.positions.length} posisi terbuka`);
+        } else {
+          log("cron", `[PnL poll] NORMAL mode — tidak ada posisi terbuka (${PNL_POLL_NORMAL_MS / 1000}s poll, ${config.schedule.managementIntervalMin}m cooldown)`);
+        }
+      }
+
+      if (!hasPositions) return; // nothing to check
+
       for (const p of result.positions) {
         if (
           !p.pnl_pct_suspicious &&
@@ -812,7 +869,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
             }
             continue;
           }
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = getPnlCooldownMs();
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -825,7 +882,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = getPnlCooldownMs();
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -839,12 +896,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
       }
     } finally {
       _pnlPollBusy = false;
+      schedulePnlPoll(); // schedule next tick with current mode
     }
-  }, 30_000);
+  }
+
+  // Start the first tick
+  schedulePnlPoll();
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
-  // Store interval ref so stopCronJobs can clear it
-  _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 

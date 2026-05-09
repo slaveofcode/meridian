@@ -163,6 +163,9 @@ Fork ini (branch `develop`) include patch stabilitas dan tuning yang diterapkan 
 | `agent.js` | Skip parameter `tool_choice` kalau `LLM_BASE_URL` mengandung `opencode.ai` | OpenCode Go return 400 di field `tool_choice` yang gak didukung |
 | `agent.js` | Tambah counter `emptyStreak` — abort setelah 3 respons LLM kosong berturut-turut | Cegah infinite loop kalau LLM return blank / tanpa tool |
 | `index.js` | Tambah rate limiter buat command Telegram `/status` — 1x per menit per chat | Cegah spam & kurangi biaya API LLM |
+| `index.js` | PnL poller dinamis: recursive setTimeout (bukan setInterval) + flag `_pnlHasOpenPositions`, interval & cooldown adaptif. Force-fetch API cuma tiap `fastPnlCooldownSec`, pake cache di antara tick biar gak kena rate limit | Deteksi stop loss lebih cepat saat ada posisi terbuka; hemat API saat idle |
+| `config.js` + `executor.js` | Tambah field `fastPnlCooldownSec` (default 20) di section schedule | Konfigurasi interval PnL cepat pas ada posisi |
+| `index.js` + `config.js` + `executor.js` | Management cycle dinamis: cron jalan tiap menit (`* * * * *`), tapi eksekusi cepet (`fastManagementIntervalMin`, default 1m) kalo ada posisi terbuka, lambat (`managementIntervalMin`) kalo idle. Di-log sebagai `[Mgmt cycle] fast/normal` | Management LLM gak perlu nunggu 3 menit kalo ada posisi; tetap hemat pas idle |
 
 ### Rekomendasi Tuning Config
 
@@ -174,18 +177,18 @@ Nilai berikut sudah teruji buat wallet saldo kecil (~0.5–1 SOL):
 | `maxPositions` | `3` | `2` | Fokus modal, risiko lebih kecil |
 | `minSolToOpen` | `0.07` | `0.15` | Reserve buffer buat gas + rebalance |
 | `gasReserve` | `0.2` | `0.03` | Diturunkan buat wallet kecil |
-| `managementIntervalMin` | `10` | `0.5` | Siklus management tiap 30 detik |
-| `screeningIntervalMin` | `30` | `5` | Screening agresif tiap 5 menit |
-| `stopLossPct` | `-50` | `-30` | Potong rugi lebih cepat |
-| `takeProfitPct` | `5` | `8` | Biarkan fee menumpuk lebih lama |
-| `trailingTriggerPct` | `3` | `3` | Mulai trailing di +3% |
-| `trailingDropPct` | `1.5` | `1.5` | Exit sensitif saat pullback |
+|| `managementIntervalMin` | `10` | `3` | Siklus management tiap 3 menit (idle). Cepet ke 1 menit pas ada posisi via `fastManagementIntervalMin` |
+|| `screeningIntervalMin` | `30` | `10` | Screening tiap 10 menit |
+|| `stopLossPct` | `-50` | `-30` | Potong rugi lebih cepat |
+|| `takeProfitPct` | `5` | `10` | Biarkan fee menumpuk lebih lama |
+|| `trailingTriggerPct` | `3` | `5` | Mulai trailing di +5% |
+|| `trailingDropPct` | `1.5` | `2` | Exit sensitif saat pullback |
 | `minFeeActiveTvlRatio` | `0.05` | `0.01` | Lebih banyak pool yang lolos |
 | `minFeePerTvl24h` | `7` | `4` | Lebih banyak pool yang lolos |
 | `outOfRangeWaitMinutes` | `30` | `15` | Reaksi OOR lebih cepat |
 | `positionSizePct` | — | `0.35` | Rasio ukuran posisi |
 | `binsBelow` | — | `69` | Range bin DLMM |
-| `lpAgentRelayEnabled` | `false` | `true` | Route PnL / Top LP via Agent Meridian (gratis, gak perlu key LPAgent) |
+| `lpAgentRelayEnabled` | `false` | `false` | Relay Agent Meridian — OFF karena sering timeout & nambah delay 30+ detik. Disable biar langsung scan Meteora lokal (lebih cepet). |
 | `useDiscordSignals` | `false` | `true` | Gabung kandidat signal Discord ke pool screening |
 | `discordSignalMode` | — | `"merge"` | Tambah signal Discord sebagai kandidat tambahan, bukan override |
 
@@ -205,6 +208,8 @@ Semua field opsional — default ditampilkan. Edit `user-config.json`.
 | `minSolToOpen` | `0.07` | Saldo SOL minimum wallet sebelum buka posisi baru |
 | `managementIntervalMin` | `10` | Seberapa sering agent management jalan (menit) |
 | `screeningIntervalMin` | `30` | Seberapa sering agent screening jalan (menit) |
+| `fastManagementIntervalMin` | `1` | Interval management cycle kalo ada posisi terbuka (menit). Minimal 1 menit. Otomatis slow ke `managementIntervalMin` saat idle |
+| `fastPnlCooldownSec` | `20` | Interval PnL poll + cooldown trigger management saat ada posisi terbuka (detik). Otomatis balik normal (30s poll, managementIntervalMin cooldown) saat semua posisi tutup |
 | `managementModel` | `openrouter/healer-alpha` | Model LLM buat kelola posisi |
 | `screeningModel` | `openrouter/hunter-alpha` | Model LLM buat screening pool |
 | `generalModel` | `openrouter/healer-alpha` | Model LLM buat chat REPL dan `/learn` |

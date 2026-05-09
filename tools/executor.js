@@ -378,6 +378,8 @@ const toolMap = {
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
+      fastManagementIntervalMin: ["schedule", "fastManagementIntervalMin"],
+      fastPnlCooldownSec: ["schedule", "fastPnlCooldownSec"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],

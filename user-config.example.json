@@ -68,6 +68,8 @@
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
   "healthCheckIntervalMin": 60,
+  "fastManagementIntervalMin": 1,
+  "fastPnlCooldownSec": 20,
 
   "temperature": 0.373,
   "maxTokens": 4096,
