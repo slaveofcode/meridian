@@ -389,6 +389,7 @@ const toolMap = {
       maxSteps: ["llm", "maxSteps"],
       // strategy
       strategy:     ["strategy", "strategy"],
+      binsBelow:    ["strategy", "maxBinsBelow", ["maxBinsBelow"]],
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],

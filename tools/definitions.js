@@ -392,7 +392,7 @@ Screening: screeningSource, minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, min
 GMGN (persisted to gmgn-config.json): gmgnApiKey, gmgnBaseUrl, gmgnInterval, gmgnOrderBy, gmgnDirection, gmgnLimit, gmgnEnrichLimit, gmgnRequestDelayMs, gmgnMaxRetries, gmgnFilters, gmgnPlatforms, gmgnMinMcap, gmgnMaxMcap, gmgnMinVolume, gmgnMinHolders, gmgnMinTokenAgeHours, gmgnMaxTokenAgeHours, gmgnAthFilterPct, gmgnMaxBundlerRate, gmgnMaxFreshWalletRate, gmgnMaxDevTeamHoldRate, gmgnPreferredKolNames, gmgnPreferredKolMinHoldPct, gmgnRequireKol, gmgnMinKolCount, gmgnMinSmartDegenCount, gmgnMinTotalFeeSol
 Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, minVolumeToRebalance, stopLossPct, takeProfitPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
-Schedule: managementIntervalMin, screeningIntervalMin
+Schedule: managementIntervalMin, screeningIntervalMin, fastManagementIntervalMin, fastPnlCooldownSec
 Models: managementModel, screeningModel, generalModel
 Strategy: strategy, minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow)
 

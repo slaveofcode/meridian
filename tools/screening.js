@@ -701,7 +701,8 @@ function round(n) {
 }
 
 function fix(n, decimals) {
-  return n != null ? Number(n.toFixed(decimals)) : null;
+  const value = numeric(n);
+  return value != null ? Number(value.toFixed(decimals)) : null;
 }
 
 function pushFilteredReason(list, pool, reason) {
