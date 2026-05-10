@@ -1,0 +1,36 @@
+{
+  "version": "0.1.0",
+  "updatedAt": 1778342309318,
+  "trackedWallets": [
+    {
+      "address": "AVFTuPEeif4Syvi4uT1yEC4CEoDmkuATQ5sCH2Ywcyob",
+      "label": "NEW",
+      "source": "AI_DETECTED",
+      "score": 50,
+      "isActive": true,
+      "addedAt": 1778341759215,
+      "lastFollowedAt": 1778341759215
+    },
+    {
+      "address": "DSxXY1Z5wNdz3ZLZUAZEWyHRGrsFd4ebVPVqbaxCqtNw",
+      "label": "NEW",
+      "source": "AI_DETECTED",
+      "score": 50,
+      "isActive": true,
+      "addedAt": 1778342055244,
+      "lastFollowedAt": 1778342055244
+    },
+    {
+      "address": "ECDsQzfwf413DQDrJnaZZEcoexWR57tifn2SJaNeQXfg",
+      "label": "NEW",
+      "source": "AI_DETECTED",
+      "score": 50,
+      "isActive": true,
+      "addedAt": 1778342309318,
+      "lastFollowedAt": 1778342309318
+    }
+  ],
+  "patterns": [],
+  "dailyReviews": [],
+  "settings": []
+}

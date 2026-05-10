@@ -123,7 +123,7 @@ async function postTelegramRaw(method, body) {
 
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+  return postTelegram("sendMessage", { text: String(text).slice(0, 4096), parse_mode: "Markdown" });
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
