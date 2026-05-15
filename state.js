@@ -505,7 +505,33 @@ export function setLastBriefingDate() {
  */
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
 
-export function syncOpenPositions(active_addresses) {
+// Cache RPC URL to avoid re-reading env
+let _rpcUrl = null;
+function getRpcUrl() {
+  if (!_rpcUrl) _rpcUrl = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
+  return _rpcUrl;
+}
+
+async function checkPositionOnChain(posId) {
+  try {
+    const res = await fetch(getRpcUrl(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getAccountInfo",
+        params: [posId, { encoding: "base64" }],
+      }),
+    });
+    const data = await res.json();
+    return data?.result?.value != null; // account exists on-chain
+  } catch {
+    return false; // on fail, proceed with normal auto-close
+  }
+}
+
+export async function syncOpenPositions(active_addresses) {
   const state = load();
   const activeSet = new Set(active_addresses);
   let changed = false;
@@ -518,6 +544,13 @@ export function syncOpenPositions(active_addresses) {
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
     if (Date.now() - deployedAt < SYNC_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+      continue;
+    }
+
+    // Fallback: check on-chain via RPC before auto-closing
+    const onChain = await checkPositionOnChain(posId);
+    if (onChain) {
+      log("state", `Position ${posId} missing from API but confirmed on-chain — keeping in state`);
       continue;
     }
 
