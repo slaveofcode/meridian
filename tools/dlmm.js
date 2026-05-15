@@ -148,7 +148,8 @@ function getTransactionInstructions(tx) {
     .map((ix) => {
       const programId = keys[ix.programIdIndex];
       if (!programId) return null;
-      const accounts = ix.accountKeyIndexes
+      const indexes = ix.accountKeyIndexes || ix.accounts || [];
+      const accounts = indexes
         .map((accountIndex) => keys[accountIndex])
         .filter(Boolean);
       return new TransactionInstruction({

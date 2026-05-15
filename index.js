@@ -1,6 +1,8 @@
 import "./envcrypt.js";
 import cron from "node-cron";
 import readline from "readline";
+import path from "path";
+import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
@@ -34,12 +36,19 @@ import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
 
-log("startup", "DLMM LP Agent starting...");
-log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
-ensureAgentId();
-bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
-startHiveMindBackgroundSync();
+const entrypointPath = process.env.pm_exec_path || process.argv[1];
+const isMain = entrypointPath
+  ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url)
+  : false;
+
+if (isMain) {
+  log("startup", "DLMM LP Agent starting...");
+  log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+  log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  ensureAgentId();
+  bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
+  startHiveMindBackgroundSync();
+}
 
 const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;

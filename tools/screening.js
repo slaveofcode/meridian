@@ -46,6 +46,17 @@ function includesCaseInsensitive(values, value) {
   return values.some((entry) => String(entry).toLowerCase() === needle);
 }
 
+function getPoolLaunchpad(pool) {
+  return (
+    pool?.token_x?.launchpad ||
+    pool?.token_x?.launchpad_platform ||
+    pool?.base_token_launchpad ||
+    pool?.launchpad ||
+    pool?.launchpad_platform ||
+    null
+  );
+}
+
 function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
@@ -57,7 +68,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const mcap = numeric(base?.market_cap);
   const baseOrganic = numeric(base?.organic_score);
   const quoteOrganic = numeric(quote?.organic_score);
-  const launchpad = base?.launchpad || pool?.base_token_launchpad || null;
+  const launchpad = getPoolLaunchpad(pool);
   const createdAt = numeric(base?.created_at);
 
   if (s.excludeHighSupplyConcentration && pool?.base_token_has_high_supply_concentration === true) {
