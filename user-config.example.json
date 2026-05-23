@@ -63,6 +63,9 @@
   "trailingTriggerPct": 3,
   "trailingDropPct": 1.5,
   "pnlSanityMaxDiffPct": 5,
+  "rapidDropEnabled": true,
+  "rapidDropPct": -30,
+  "rapidDropCooldownSec": 60,
   "solMode": false,
 
   "managementIntervalMin": 10,

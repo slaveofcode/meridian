@@ -204,6 +204,10 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // Rapid drop protection — close immediately if PnL drops this much between consecutive polls
+    rapidDropEnabled:      u.rapidDropEnabled      ?? true,
+    rapidDropPct:          u.rapidDropPct          ?? -30,   // close when drop >= X% in one poll interval (~20-30s)
+    rapidDropCooldownSec:  u.rapidDropCooldownSec  ?? 60,    // min seconds between rapid drop triggers per position
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },

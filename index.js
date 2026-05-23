@@ -93,6 +93,7 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
+const _rapidDropState = new Map(); // position_address → { pnlPct, lastTriggeredAt }
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
 const TRAILING_PEAK_CONFIRM_TOLERANCE = 0.85;
 const TRAILING_DROP_CONFIRM_DELAY_MS = 15_000;
@@ -863,6 +864,25 @@ Summarize the current portfolio health, total fees earned, and performance of al
       if (!hasPositions) return; // nothing to check
 
       for (const p of result.positions) {
+        // Rapid drop protection — PnL turun drastis antar poll → close langsung tanpa nunggu management cycle
+        if (config.management.rapidDropEnabled && !p.pnl_pct_suspicious && p.pnl_pct != null) {
+          const nowMs = Date.now();
+          const prev = _rapidDropState.get(p.position);
+          if (prev != null && prev.pnlPct != null && p.pnl_pct != null) {
+            const drop = p.pnl_pct - prev.pnlPct;
+            const inCooldown = prev.lastTriggeredAt != null && (nowMs - prev.lastTriggeredAt) < (config.management.rapidDropCooldownSec * 1000);
+            if (!inCooldown && drop <= config.management.rapidDropPct) {
+              _rapidDropState.set(p.position, { pnlPct: p.pnl_pct, lastTriggeredAt: nowMs });
+              log("cron", `[RAPID DROP] ${p.pair} — PnL dropped ${drop.toFixed(2)}% (${prev.pnlPct.toFixed(2)}% → ${p.pnl_pct.toFixed(2)}%) — closing immediately`);
+              closePosition({ position_address: p.position, reason: `rapid_drop:${drop.toFixed(1)}%` }).catch(e =>
+                log("cron_error", `[RAPID DROP] Close failed for ${p.position}: ${e.message}`)
+              );
+              sendMessage(`🚨 <b>Rapid Drop</b>\n${p.pair} — PnL dropped ${drop.toFixed(1)}% in ~20s\n${prev.pnlPct.toFixed(1)}% → ${p.pnl_pct.toFixed(1)}%\n⚡ Closing immediately`).catch(() => {});
+              continue;
+            }
+          }
+          _rapidDropState.set(p.position, { pnlPct: p.pnl_pct, lastTriggeredAt: prev?.lastTriggeredAt || null });
+        }
         if (
           !p.pnl_pct_suspicious &&
           queuePeakConfirmation(p.position, p.pnl_pct, { immediate: !shouldUsePnlRecheck() }) &&
@@ -1221,7 +1241,8 @@ function renderSettingsMenu(page = "main") {
     `Mode: ${config.management.solMode ? "SOL" : "USD"} | Relay: ${config.api.lpAgentRelayEnabled ? "on" : "off"}`,
     `Screening: ${config.screening.source} | GMGN KOL ${config.gmgn.requireKol ? "required" : "preferred"}`,
     `Strategy: ${config.strategy.strategy} | deploy ${config.management.deployAmountSol} SOL | max pos ${config.risk.maxPositions}`,
-    `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"}`,
+    `TP/SL: ${config.management.takeProfitPct}% / ${config.management.stopLossPct}% | trailing ${config.management.trailingTakeProfit ? "on" : "off"} | rapid drop ${config.management.rapidDropEnabled ? "on" : "off"}`,
+    `Drop: trail ${config.management.trailingDropPct}% | rapid ${config.management.rapidDropPct}% (${config.management.rapidDropCooldownSec}s cooldown)`,
     `Indicators: ${config.indicators.enabled ? "on" : "off"} | entry ${config.indicators.entryPreset} | ${fmtSettingValue(config.indicators.intervals)}`,
   ].join("\n");
 
@@ -1258,6 +1279,9 @@ function renderSettingsMenu(page = "main") {
       [toggleButton("trailingTakeProfit", "Trailing TP")],
       inputButton("trailingTriggerPct", "Trail trigger", { digits: 1 }),
       inputButton("trailingDropPct", "Trail drop", { digits: 1 }),
+      [toggleButton("trailingTakeProfit", "Trailing TP"), toggleButton("rapidDropEnabled", "Rapid drop")],
+      inputButton("rapidDropPct", "Drop trigger %"),
+      inputButton("rapidDropCooldownSec", "Drop cooldown s"),
       [toggleButton("repeatDeployCooldownEnabled", "Repeat cooldown")],
       inputButton("repeatDeployCooldownTriggerCount", "Repeat count"),
       inputButton("repeatDeployCooldownHours", "Repeat hrs"),
