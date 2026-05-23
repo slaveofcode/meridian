@@ -41,3 +41,6 @@ test-*.js
 node_modules/
 data/
 *.tmp
+
+AGENTS.md
+.claude/
