@@ -444,7 +444,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       : `No active strategy — use strategy=${config.strategy.strategy}, bins_above=0, SOL only.`;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
-    const topCandidates = await getTopCandidates({ limit: 10 }).catch((e) => ({ _error: e.message }));
+    const topCandidates = await getTopCandidates({ limit: config.screening.candidateLimit ?? 10 }).catch((e) => ({ _error: e.message }));
     if (topCandidates?._error) {
       screenReport = `Screening failed: ${topCandidates._error}`;
       return screenReport;

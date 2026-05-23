@@ -332,12 +332,12 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ──────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -347,8 +347,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -363,9 +363,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -412,9 +412,9 @@ export function evolveThresholds(perfData, config) {
 
   // Apply to live config object immediately
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.maxVolatility         != null) s.maxVolatility         = changes.maxVolatility;
+  if (changes.minFeeActiveTvlRatio  != null) s.minFeeActiveTvlRatio  = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic            != null) s.minOrganic            = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
   const data = load();
@@ -589,9 +589,11 @@ export function clearPerformance() {
 // ─── Lesson Retrieval ──────────────────────────────────────────
 
 // Tags that map to each agent role — used for role-aware lesson injection
+// Performance-derived tags (efficient, failed, worked, oor, volume_collapse, bid_ask, spot)
+// are also included so auto-generated lessons aren't silently filtered out from SCREENER/MANAGER.
 const ROLE_TAGS = {
-  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic"],
-  MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
+  SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic", "efficient", "failed", "worked", "oor", "volume_collapse", "bid_ask", "spot", "evolution", "config_change"],
+  MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim", "efficient", "failed", "worked", "evolution", "config_change"],
   GENERAL:  [], // all lessons
 };
 
@@ -617,9 +619,9 @@ export function getLessonsForPrompt(opts = {}) {
 
   // Smaller caps for automated cycles — they don't need the full lesson history
   const isAutoCycle = agentType === "SCREENER" || agentType === "MANAGER";
-  const PINNED_CAP  = isAutoCycle ? 5  : 10;
-  const ROLE_CAP    = isAutoCycle ? 6  : 15;
-  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 10 : 35);
+  const PINNED_CAP  = isAutoCycle ? 10  : 10;
+  const ROLE_CAP    = isAutoCycle ? 15  : 15;
+  const RECENT_CAP  = maxLessons ?? (isAutoCycle ? 30 : 35);
 
   const outcomePriority = { bad: 0, poor: 1, failed: 1, good: 2, worked: 2, manual: 1, neutral: 3, evolution: 2 };
   const byPriority = (a, b) => (outcomePriority[a.outcome] ?? 3) - (outcomePriority[b.outcome] ?? 3);

@@ -11,6 +11,22 @@ const METEORA_DLMM_API = "https://dlmm.datapi.meteora.ag";
 const SUPPORTED_INTERVALS = new Set(["1m", "5m", "1h", "6h", "24h"]);
 let lastGmgnRequestAt = 0;
 
+// Proxy agent for residential proxy (bypass Cloudflare)
+let proxyDispatcher = null;
+async function getProxyDispatcher() {
+  const proxyUrl = config.gmgn?.proxyUrl;
+  if (!proxyUrl) return null;
+  if (proxyDispatcher) return proxyDispatcher;
+  try {
+    const { ProxyAgent } = await import("undici");
+    proxyDispatcher = new ProxyAgent(proxyUrl);
+    log("info", `[gmgn] proxy configured`);
+  } catch (err) {
+    log("warn", `[gmgn] proxy init failed: ${err.message}`);
+  }
+  return proxyDispatcher;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -58,37 +74,49 @@ async function gmgnFetch(pathname, { method = "GET", params = {}, body = null } 
   });
 
   const maxRetries = Math.max(0, Number(config.gmgn?.maxRetries ?? 2));
+  const dispatcher = await getProxyDispatcher();
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     await paceGmgnRequest();
-    const res = await fetch(url, {
-      method,
-      headers: {
-        "X-APIKEY": getApiKey(),
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : null,
-    });
-    const text = await res.text().catch(() => "");
-    let payload = {};
+    const controller = new AbortController();
+    const timeoutTimer = setTimeout(() => controller.abort(), 15_000);
     try {
-      payload = text ? JSON.parse(text) : {};
-    } catch {
-      payload = { raw: text };
+      const fetchOpts = {
+        method,
+        headers: {
+          "X-APIKEY": getApiKey(),
+          "Content-Type": "application/json",
+        },
+        body: body ? JSON.stringify(body) : null,
+      };
+      if (dispatcher) fetchOpts.dispatcher = dispatcher;
+      const res = await fetch(url, { ...fetchOpts, signal: controller.signal });
+      clearTimeout(timeoutTimer);
+      const text = await res.text().catch(() => "");
+      let payload = {};
+      try {
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        payload = { raw: text };
+      }
+      const message = payload?.message || payload?.error || payload?.raw || `GMGN ${pathname} ${res.status}`;
+      const rateLimited = res.status === 429 || /rate limit|temporarily banned/i.test(String(message));
+      if (res.ok) return payload;
+      if (rateLimited && attempt < maxRetries) {
+        const retryAfter = Number(res.headers.get("retry-after"));
+        const backoffMs = Number.isFinite(retryAfter)
+          ? retryAfter * 1000
+          : /temporarily banned/i.test(String(message))
+            ? 60000
+            : Math.min(30000, 3000 * Math.pow(2, attempt));
+        await sleep(backoffMs);
+        continue;
+      }
+      throw new Error(message);
+    } catch (err) {
+      clearTimeout(timeoutTimer);
+      if (err.name === "AbortError") throw new Error(`GMGN ${pathname} timeout after 15s`);
+      throw err;
     }
-    const message = payload?.message || payload?.error || payload?.raw || `GMGN ${pathname} ${res.status}`;
-    const rateLimited = res.status === 429 || /rate limit|temporarily banned/i.test(String(message));
-    if (res.ok) return payload;
-    if (rateLimited && attempt < maxRetries) {
-      const retryAfter = Number(res.headers.get("retry-after"));
-      const backoffMs = Number.isFinite(retryAfter)
-        ? retryAfter * 1000
-        : /temporarily banned/i.test(String(message))
-          ? 60000
-          : Math.min(30000, 3000 * Math.pow(2, attempt));
-      await sleep(backoffMs);
-      continue;
-    }
-    throw new Error(message);
   }
   throw new Error(`GMGN ${pathname} failed`);
 }

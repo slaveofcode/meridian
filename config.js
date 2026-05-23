@@ -81,9 +81,10 @@ export const config = {
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
-    source:            u.screeningSource    ?? "meteora", // meteora | gmgn
+    source:            u.screeningSource    ?? "meteora",
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    maxVolatility:       u.maxVolatility   ?? null,       // null = no cap; evolved by lessons
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -96,19 +97,29 @@ export const config = {
     maxBinStep:        u.maxBinStep        ?? 125,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
+    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,
     useDiscordSignals: u.useDiscordSignals ?? false,
-    discordSignalMode: u.discordSignalMode ?? "merge", // merge | only
-    avoidPvpSymbols:   u.avoidPvpSymbols   ?? true, // avoid exact-symbol rivals with real active pools
-    blockPvpSymbols:   u.blockPvpSymbols   ?? false, // hard-filter PVP rivals before the LLM sees them
-    maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
-    maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
-    allowedLaunchpads: u.allowedLaunchpads ?? [],  // allow-list launchpads, [] = no allow-list
-    blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
-    minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
-    maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
-    athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    discordSignalMode: u.discordSignalMode ?? "merge",
+    avoidPvpSymbols:   u.avoidPvpSymbols   ?? true,
+    blockPvpSymbols:   u.blockPvpSymbols   ?? false,
+    maxBundlePct:      u.maxBundlePct      ?? 30,
+    maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,
+    maxTop10Pct:       u.maxTop10Pct       ?? 60,
+    allowedLaunchpads: u.allowedLaunchpads ?? [],
+    blockedLaunchpads:  u.blockedLaunchpads  ?? [],
+    minTokenAgeHours:   u.minTokenAgeHours   ?? null,
+    maxTokenAgeHours:   u.maxTokenAgeHours   ?? null,
+    athFilterPct:       u.athFilterPct       ?? null,
+    // PVP rival detection thresholds
+    pvpMinActiveTvl:    u.pvpMinActiveTvl    ?? 5_000,
+    pvpMinHolders:      u.pvpMinHolders      ?? 500,
+    pvpMinGlobalFeesSol: u.pvpMinGlobalFeesSol ?? 30,
+    pvpShortlistLimit:  u.pvpShortlistLimit  ?? 2,
+    pvpRivalLimit:      u.pvpRivalLimit      ?? 2,
+    // Screening pipeline
+    candidateLimit:     u.candidateLimit     ?? 10,  // max candidates sent to LLM per cycle
+    minConfidenceScore: u.minConfidenceScore ?? 5,   // 1-10, LLM scores each candidate; only deploy if >= threshold
+    pageSize:           u.pageSize           ?? 50,  // pools fetched per discovery call
   },
 
   gmgn: {
@@ -342,6 +353,14 @@ export function reloadScreeningThresholds() {
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
+    if (fresh.maxVolatility    != null) s.maxVolatility    = fresh.maxVolatility;
+    if (fresh.pvpMinActiveTvl  != null) s.pvpMinActiveTvl  = fresh.pvpMinActiveTvl;
+    if (fresh.pvpMinHolders    != null) s.pvpMinHolders    = fresh.pvpMinHolders;
+    if (fresh.pvpMinGlobalFeesSol != null) s.pvpMinGlobalFeesSol = fresh.pvpMinGlobalFeesSol;
+    if (fresh.pvpShortlistLimit != null) s.pvpShortlistLimit = fresh.pvpShortlistLimit;
+    if (fresh.pvpRivalLimit    != null) s.pvpRivalLimit    = fresh.pvpRivalLimit;
+    if (fresh.candidateLimit   != null) s.candidateLimit   = fresh.candidateLimit;
+    if (fresh.pageSize         != null) s.pageSize         = fresh.pageSize;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelowVal = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

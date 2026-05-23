@@ -9,11 +9,7 @@ import { discoverGmgnPools } from "./gmgn.js";
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
-const PVP_SHORTLIST_LIMIT = 2;
-const PVP_RIVAL_LIMIT = 2;
-const PVP_MIN_ACTIVE_TVL = 5_000;
-const PVP_MIN_HOLDERS = 500;
-const PVP_MIN_GLOBAL_FEES_SOL = 30;
+// PVP thresholds — controlled via config.screening.pvp* keys
 
 function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
@@ -133,7 +129,8 @@ async function searchAssetsBySymbol(symbol) {
 }
 
 async function findRivalPool(mint) {
-  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
+  const s = config.screening;
+  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${s.pvpMinActiveTvl}`)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`rival pool search ${res.status}`);
   const data = await res.json();
@@ -142,9 +139,10 @@ async function findRivalPool(mint) {
 }
 
 async function enrichPvpRisk(pools) {
+  const s = config.screening;
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, PVP_SHORTLIST_LIMIT);
+    .slice(0, s.pvpShortlistLimit);
 
   if (shortlist.length === 0) return;
 
@@ -164,12 +162,12 @@ async function enrichPvpRisk(pools) {
     const rivalAssets = assets
       .filter((asset) => normalizeSymbol(asset?.symbol) === symbol && asset?.id && asset.id !== ownMint)
       .sort((a, b) => Number(b?.liquidity || 0) - Number(a?.liquidity || 0))
-      .slice(0, PVP_RIVAL_LIMIT);
+      .slice(0, s.pvpRivalLimit);
 
     for (const rival of rivalAssets) {
       const rivalHolders = Number(rival?.holderCount || 0);
       const rivalFees = Number(rival?.fees || 0);
-      if (rivalHolders < PVP_MIN_HOLDERS || rivalFees < PVP_MIN_GLOBAL_FEES_SOL) continue;
+      if (rivalHolders < s.pvpMinHolders || rivalFees < s.pvpMinGlobalFeesSol) continue;
 
       const rivalPool = await findRivalPool(rival.id).catch(() => null);
       if (!rivalPool) continue;
@@ -196,9 +194,10 @@ async function enrichPvpRisk(pools) {
  * Returns condensed data optimized for LLM consumption (saves tokens).
  */
 export async function discoverPools({
-  page_size = 50,
+  page_size,
 } = {}) {
   const s = config.screening;
+  page_size = page_size ?? s.pageSize ?? 50;
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -363,8 +362,9 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+export async function getTopCandidates({ limit } = {}) {
   const { config } = await import("../config.js");
+  limit = limit ?? config.screening.candidateLimit ?? 10;
   const source = String(config.screening.source || "meteora").toLowerCase();
   if (!["meteora", "gmgn"].includes(source)) {
     throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
@@ -614,8 +614,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Fetches top 50 pools from discovery API and finds the matching address.
  * Returns the full unfiltered API object (all fields, not condensed).
  */
-export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
+export async function getPoolDetail({ pool_address, timeframe }) {
   const useServerDiscovery = !!config.api.publicApiKey;
+  timeframe = timeframe || config.screening.timeframe || "5m";
+
   const url = useServerDiscovery
     ? `${config.api.url}/discovery/pools/${pool_address}?timeframe=${encodeURIComponent(timeframe)}`
     : `${POOL_DISCOVERY_BASE}/pools?` +
