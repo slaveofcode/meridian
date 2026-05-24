@@ -723,5 +723,7 @@ function pushFilteredReason(list, pool, reason) {
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
     reason,
+    mint: pool.base?.mint || pool.mint || null,
+    pool: pool.pool || null,
   });
 }

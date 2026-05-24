@@ -219,9 +219,15 @@ export async function runManagementCycle({ silent = false } = {}) {
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      const inCooldown = Date.now() - _screeningLastTriggered < screeningCooldownMs;
+      if (!inCooldown) {
+        log("cron", "No open positions — triggering screening cycle");
+        mgmtReport = "No open positions. Triggering screening cycle.";
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      } else {
+        log("cron", `No open positions — skipping screening (cooldown ${Math.round((screeningCooldownMs - (Date.now() - _screeningLastTriggered)) / 1000)}s)`);
+        mgmtReport = "Skipping screening (cooldown).";
+      }
       return mgmtReport;
     }
 
@@ -1025,7 +1031,16 @@ function buildGmgnFunnelReport(stageCounts, allFiltered = [], { fromStage = 1 } 
     if (f.stage < fromStage) continue;
     const key = `s${f.stage}`;
     if (!byStage[key]) byStage[key] = [];
-    byStage[key].push(`${f.name}: ${f.reason}`);
+    const links = [];
+    if (f.address) {
+      links.push(`[GMGN](https://gmgn.ai/sol/token/${f.address})`);
+      links.push(`[DEX](https://dexscreener.com/solana/${f.address})`);
+    }
+    if (f.pool) {
+      links.push(`[MET](https://app.meteora.ag/dlmm/${f.pool})`);
+    }
+    const linkTag = links.length > 0 ? ` (${links.join(" | ")})` : "";
+    byStage[key].push(`${f.name}${linkTag}: ${f.reason}`);
   }
   const stageLabels = { s2: "S2 info", s3: "S3 pool", s4: "S4 indicators", s5: "S5 pick" };
   const details = Object.entries(byStage)

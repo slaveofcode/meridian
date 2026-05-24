@@ -144,6 +144,7 @@ export async function editMessage(text, messageId) {
   return postTelegram("editMessageText", {
     message_id: messageId,
     text: String(text).slice(0, 4096),
+    parse_mode: "Markdown",
   });
 }
 

@@ -12,6 +12,7 @@ import {
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { nextRpcUrl } from "./rpc-rotate.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -93,8 +94,13 @@ let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
+    _connection = new Connection(nextRpcUrl(), "confirmed");
   }
+  return _connection;
+}
+
+function getNewConnection() {
+  _connection = new Connection(nextRpcUrl(), "confirmed");
   return _connection;
 }
 

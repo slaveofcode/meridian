@@ -8,12 +8,18 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { nextHeliusWalletUrl, nextRpcUrl } from "./rpc-rotate.js";
 
 let _connection = null;
 let _wallet = null;
 
 function getConnection() {
   if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+  return _connection;
+}
+
+function createNewConnection() {
+  _connection = new Connection(nextRpcUrl(), "confirmed");
   return _connection;
 }
 
@@ -70,43 +76,53 @@ export async function getWalletBalances() {
     return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
   }
 
+  const keys = HELIUS_KEY.split(',').map(k => k.trim()).filter(Boolean);
+
   try {
-    const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-    
-    if (!res.ok) {
+    // Try each key in rotation on 429
+    for (let attempt = 0; attempt < keys.length * 2; attempt++) {
+      const ep = nextHeliusWalletUrl();
+      if (!ep) break;
+      const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${ep.key}`;
+      const res = await fetch(url);
+
+      if (res.ok) {
+        const data = await res.json();
+        const balances = data.balances || [];
+        const solEntry = balances.find(b => b.mint === config.tokens.SOL || b.symbol === "SOL");
+        const usdcEntry = balances.find(b => b.mint === config.tokens.USDC || b.symbol === "USDC");
+
+        const solBalance = solEntry?.balance || 0;
+        const solPrice = solEntry?.pricePerToken || 0;
+        const solUsd = solEntry?.usdValue || 0;
+        const usdcBalance = usdcEntry?.balance || 0;
+
+        // ─── Map all tokens ───────────────────────────────────────
+        const enrichedTokens = balances.map(b => ({
+          mint: b.mint,
+          symbol: b.symbol || b.mint.slice(0, 8),
+          balance: b.balance,
+          usd: b.usdValue ? Math.round(b.usdValue * 100) / 100 : null,
+        }));
+
+        return {
+          wallet: walletAddress,
+          sol: Math.round(solBalance * 1e6) / 1e6,
+          sol_price: Math.round(solPrice * 100) / 100,
+          sol_usd: Math.round(solUsd * 100) / 100,
+          usdc: Math.round(usdcBalance * 100) / 100,
+          tokens: enrichedTokens,
+          total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
+        };
+      }
+      // 429 — try next key
+      if (res.status === 429) {
+        log("wallet_warn", `Helius 429 — rotating key (attempt ${attempt + 1})`);
+        continue;
+      }
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
     }
-
-    const data = await res.json();
-    const balances = data.balances || [];
-
-    // ─── Find SOL and USDC ────────────────────────────────────
-    const solEntry = balances.find(b => b.mint === config.tokens.SOL || b.symbol === "SOL");
-    const usdcEntry = balances.find(b => b.mint === config.tokens.USDC || b.symbol === "USDC");
-
-    const solBalance = solEntry?.balance || 0;
-    const solPrice = solEntry?.pricePerToken || 0;
-    const solUsd = solEntry?.usdValue || 0;
-    const usdcBalance = usdcEntry?.balance || 0;
-
-    // ─── Map all tokens ───────────────────────────────────────
-    const enrichedTokens = balances.map(b => ({
-      mint: b.mint,
-      symbol: b.symbol || b.mint.slice(0, 8),
-      balance: b.balance,
-      usd: b.usdValue ? Math.round(b.usdValue * 100) / 100 : null,
-    }));
-
-    return {
-      wallet: walletAddress,
-      sol: Math.round(solBalance * 1e6) / 1e6,
-      sol_price: Math.round(solPrice * 100) / 100,
-      sol_usd: Math.round(solUsd * 100) / 100,
-      usdc: Math.round(usdcBalance * 100) / 100,
-      tokens: enrichedTokens,
-      total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
-    };
+    throw new Error("All Helius API keys exhausted (429)");
   } catch (error) {
     log("wallet_error", error.message);
     return {
