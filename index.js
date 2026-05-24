@@ -24,6 +24,7 @@ import {
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  setBotCommands,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -2173,6 +2174,7 @@ if (isTTY) {
   launchCron();
   maybeRunMissedBriefing().catch(() => { });
 
+  setBotCommands().catch(() => {}); // Register / commands menu
   startPolling(telegramHandler);
 
   console.log(`

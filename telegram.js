@@ -139,6 +139,32 @@ export async function sendHTML(html) {
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
 
+const BOT_COMMANDS = [
+  { command: "main", description: "🏠 Menu utama" },
+  { command: "status", description: "👛 Wallet + positions" },
+  { command: "positions", description: "📊 Open positions" },
+  { command: "anal", description: "🔍 Analisis token (mint)" },
+  { command: "screen", description: "🔎 Quick screening candidates" },
+  { command: "candidates", description: "📋 Cached candidates" },
+  { command: "deploy", description: "📤 Deploy candidate (nomor)" },
+  { command: "close", description: "❌ Close position (nomor)" },
+  { command: "closeall", description: "⚠️ Close semua positions" },
+  { command: "set", description: "📝 Set instruction (nomor note)" },
+  { command: "pool", description: "🔎 Detail position (nomor)" },
+  { command: "config", description: "⚙️ Show runtime config" },
+  { command: "settings", description: "🎛 Settings menu" },
+  { command: "setcfg", description: "🔧 Update config (key value)" },
+  { command: "briefing", description: "📋 Morning briefing" },
+  { command: "pause", description: "⏸ Stop cron cycles" },
+  { command: "resume", description: "▶️ Start cron cycles" },
+  { command: "help", description: "📖 All commands" },
+];
+
+export async function setBotCommands() {
+  if (!TOKEN) return;
+  return postTelegram("setMyCommands", { commands: BOT_COMMANDS });
+}
+
 export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
