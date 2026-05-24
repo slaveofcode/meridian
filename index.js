@@ -1151,6 +1151,134 @@ function formatConfigSnapshot() {
   ].join("\n");
 }
 
+// ── /main menu ────────────────────────────────────────────────────────────
+async function showMainMenu() {
+  const [wallet, positions] = await Promise.all([
+    getWalletBalances().catch(() => ({ sol: 0, usd: 0 })),
+    getMyPositions({ force: true }).catch(() => ({ positions: [], total_positions: 0 })),
+  ]);
+  const header = [
+    `🤖 *Meridian* — DLMM LP Agent`,
+    `👛 ${wallet.sol.toFixed(4)} SOL ($${wallet.usd.toFixed(2)})`,
+    `📊 ${positions.total_positions} position(s) open`,
+    cronStarted ? `🟢 Active` : `🔴 Paused`,
+    `Cycle: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
+  ].join("\n");
+  const buttons = [
+    [{ text: "👛 Wallet & Status", callback_data: "main:wallet" }],
+    [{ text: "📊 Positions", callback_data: "main:positions" }],
+    [{ text: "🔍 Quick Screen", callback_data: "main:screen" }],
+    [{ text: "⚙️ Settings", callback_data: "main:settings" }],
+    [{ text: "🧠 Help & Commands", callback_data: "main:help" }],
+  ];
+  await sendMessageWithButtons(header, buttons);
+}
+
+async function handleMainMenuCallback(msg) {
+  const action = msg.text.replace("main:", "");
+  await answerCallbackQuery(msg.callbackQueryId, "");
+  switch (action) {
+    case "wallet": {
+      const [wallet, positions] = await Promise.all([
+        getWalletBalances(),
+        getMyPositions({ force: true }),
+      ]);
+      await editMessage(formatWalletStatus(wallet, positions), msg.messageId);
+      break;
+    }
+    case "positions": {
+      const { positions, total_positions } = await getMyPositions({ force: true });
+      if (!total_positions) {
+        await editMessage("📊 No open positions.", msg.messageId);
+        return;
+      }
+      const cur = config.management.solMode ? "◎" : "$";
+      const lines = positions.map((p, i) => {
+        const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
+        const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+        const oor = !p.in_range ? " ⚠️OOR" : "";
+        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+      });
+      await editMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}`, msg.messageId);
+      break;
+    }
+    case "screen": {
+      const report = await runDeterministicScreen(5);
+      await editMessage(report, msg.messageId);
+      break;
+    }
+    case "settings":
+      await showSettingsMenu({ messageId: msg.messageId });
+      break;
+    case "help":
+      await editMessage(formatHelpText(), msg.messageId);
+      break;
+  }
+}
+
+// ── /anal <mint> ──────────────────────────────────────────────────────────
+async function analyzeToken(mint) {
+  const msg = await sendMessage(`🔍 Analyzing \`${mint.slice(0, 8)}...\` — fetching data...`);
+
+  try {
+    const [infoResult, narrativeResult] = await Promise.allSettled([
+      getTokenInfo({ query: mint }),
+      getTokenNarrative({ mint }),
+    ]);
+
+    const info = infoResult.status === "fulfilled" ? infoResult.value : null;
+    const narrative = narrativeResult.status === "fulfilled" ? narrativeResult.value : null;
+    const token = info?.results?.[0] || info;
+
+    if (!token || !token.name) {
+      await editMessage(`❌ Token not found: \`${mint}\``, msg.result.message_id);
+      return;
+    }
+
+    const sym = token.symbol || "?";
+    const name = token.name || "?";
+    const price = token.price != null ? `$${Number(token.price).toFixed(8)}` : "?";
+    const mcap = token.mcap != null ? `$${Number(token.mcap).toLocaleString()}` : "?";
+    const liq = token.liquidity != null ? `$${Number(token.liquidity).toLocaleString()}` : "?";
+    const holders = token.holders ?? "?";
+    const fees = token.global_fees_sol != null ? `${token.global_fees_sol} SOL` : "?";
+    const organic = token.organic_score != null ? `${token.organic_score}%` : "?";
+    const audit = token.audit || {};
+    const top10 = audit.top_holders_pct ? `${audit.top_holders_pct}%` : "?";
+    const bots = audit.bot_holders_pct ? `${audit.bot_holders_pct}%` : "?";
+    const graduated = token.graduated ? "✅" : "❌";
+    const launchpad = token.launchpad || "?";
+
+    let stats1h = "";
+    if (token.stats_1h) {
+      const s = token.stats_1h;
+      stats1h = `1h: ${s.price_change ?? "?"}% | vol $${s.buy_vol ?? "?"}/${s.sell_vol ?? "?"} | net buyers ${s.net_buyers ?? "?"}`;
+    }
+
+    const narrText = narrative?.narrative
+      ? `\n\n📝 *Narrative:* ${narrative.narrative.slice(0, 300)}`
+      : "";
+
+    const lines = [
+      `*${sym}* — ${name}`,
+      ``,
+      `💰 Price: ${price} | Mcap: ${mcap}`,
+      `💧 Liquidity: ${liq} | Holders: ${holders}`,
+      `🧬 Organic: ${organic} | Fees: ${fees}`,
+      `🚀 Graduated: ${graduated} | Launchpad: ${launchpad}`,
+      `🔒 Top10: ${top10} | Bots: ${bots}`,
+      stats1h ? `📈 ${stats1h}` : null,
+      narrText,
+      ``,
+      `🔗 [GMGN](https://gmgn.ai/sol/token/${mint}) | [DEX](https://dexscreener.com/solana/${mint}) | [Jupiter](https://jup.ag/swap/SOL-${mint})`,
+    ].filter(Boolean).join("\n");
+
+    await editMessage(lines, msg.result.message_id);
+  } catch (e) {
+    await editMessage(`❌ Analysis failed: ${e.message}`, msg.result.message_id);
+  }
+}
+
 function parseConfigValue(raw) {
   const value = String(raw ?? "").trim();
   if (!value.length) return "";
@@ -1645,6 +1773,14 @@ async function telegramHandler(msg) {
     }
     return;
   }
+  if (msg?.isCallback && text.startsWith("main:")) {
+    try {
+      await handleMainMenuCallback(msg);
+    } catch (e) {
+      await answerCallbackQuery(msg.callbackQueryId, e.message).catch(() => {});
+    }
+    return;
+  }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
@@ -1671,6 +1807,11 @@ async function telegramHandler(msg) {
 
   if (text === "/help") {
     await sendMessage(formatHelpText()).catch(() => {});
+    return;
+  }
+
+  if (text === "/main" || text === "/start") {
+    await showMainMenu().catch((e) => sendMessage(`Error: ${e.message}`).catch(() => {}));
     return;
   }
 
@@ -1848,6 +1989,17 @@ async function telegramHandler(msg) {
         `Position: ${result.position || "n/a"}`,
         result.txs?.length ? `Tx: ${result.txs[0]}` : null,
       ].filter(Boolean).join("\n")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  const analMatch = text.match(/^\/anal\s+([A-Za-z0-9]{32,44})$/i);
+  if (analMatch) {
+    try {
+      const mint = analMatch[1];
+      await analyzeToken(mint);
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }
