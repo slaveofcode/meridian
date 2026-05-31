@@ -4,21 +4,33 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
-import { discoverGmgnPools } from "./gmgn.js";
+import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
-// PVP thresholds — controlled via config.screening.pvp* keys
+const MIN_VOLATILITY_TIMEFRAME = "30m";
+const TIMEFRAME_MINUTES = {
+  "5m": 5,
+  "15m": 15,
+  "30m": 30,
+  "1h": 60,
+  "2h": 120,
+  "4h": 240,
+  "12h": 720,
+  "24h": 1440,
+};
+const PVP_SHORTLIST_LIMIT = 2;
+const PVP_RIVAL_LIMIT = 2;
+const PVP_MIN_ACTIVE_TVL = 5_000;
+const PVP_MIN_HOLDERS = 500;
+const PVP_MIN_GLOBAL_FEES_SOL = 30;
 
 function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
 function scoreCandidate(pool) {
-  if (Number.isFinite(Number(pool.gmgn_score))) {
-    return Number(pool.gmgn_score) + Number(pool.fee_active_tvl_ratio || 0) * 500;
-  }
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
   const volume = Number(pool.volume_window || 0);
@@ -27,6 +39,7 @@ function scoreCandidate(pool) {
 }
 
 function numeric(value) {
+  if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
@@ -43,14 +56,28 @@ function includesCaseInsensitive(values, value) {
 }
 
 function getPoolLaunchpad(pool) {
-  return (
-    pool?.token_x?.launchpad ||
-    pool?.token_x?.launchpad_platform ||
+  const base = pool?.token_x || {};
+  return base?.launchpad ||
+    base?.launchpad_platform ||
     pool?.base_token_launchpad ||
     pool?.launchpad ||
     pool?.launchpad_platform ||
-    null
-  );
+    null;
+}
+
+function getPoolBaseMint(pool) {
+  return pool?.token_x?.address ||
+    pool?.base_token_address ||
+    pool?.base_mint ||
+    pool?.base?.mint ||
+    null;
+}
+
+function getVolatilityTimeframe(sourceTimeframe) {
+  const source = String(sourceTimeframe || "").trim();
+  const sourceMinutes = TIMEFRAME_MINUTES[source];
+  const minMinutes = TIMEFRAME_MINUTES[MIN_VOLATILITY_TIMEFRAME];
+  return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
 function getRawPoolScreeningRejectReason(pool, s) {
@@ -59,6 +86,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const binStep = numeric(pool?.dlmm_params?.bin_step);
   const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
+  const volatility = numeric(pool?.volatility);
   const volume = numeric(pool?.volume);
   const holders = numeric(pool?.base_token_holders);
   const mcap = numeric(base?.market_cap);
@@ -86,8 +114,8 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
-  if (!isUsableVolatility(pool?.volatility)) {
-    return `volatility ${pool?.volatility ?? "unknown"} is unusable`;
+  if (!isUsableVolatility(volatility)) {
+    return `volatility ${volatility ?? "unknown"} is unusable`;
   }
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
@@ -95,8 +123,14 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
     return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
   }
-  if (Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0 && !includesCaseInsensitive(s.allowedLaunchpads, launchpad)) {
-    return `launchpad ${launchpad || "unknown"} not in allow-list`;
+  if (
+    pool?.discord_signal &&
+    Array.isArray(s.allowedLaunchpads) &&
+    s.allowedLaunchpads.length > 0 &&
+    launchpad &&
+    !includesCaseInsensitive(s.allowedLaunchpads, launchpad)
+  ) {
+    return `launchpad ${launchpad} not in allow-list`;
   }
   if (includesCaseInsensitive(s.blockedLaunchpads, launchpad)) {
     return `blocked launchpad (${launchpad})`;
@@ -113,12 +147,92 @@ function getRawPoolScreeningRejectReason(pool, s) {
 }
 
 async function fetchDiscordSignalCandidates() {
-  const res = await fetch(`${config.api.url}/signals/discord/candidates`, {
-    headers: config.api.publicApiKey ? { "x-api-key": config.api.publicApiKey } : {},
+  const res = await fetch(`${getAgentMeridianBase()}/signals/discord/candidates`, {
+    headers: getAgentMeridianHeaders(),
   });
   if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.candidates) ? data.candidates : [];
+}
+
+async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category }) {
+  const url = `${POOL_DISCOVERY_BASE}/pools?` +
+    `page_size=${page_size}` +
+    `&filter_by=${encodeURIComponent(filters)}` +
+    `&timeframe=${timeframe}` +
+    `&category=${category}`;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+  const url = `${POOL_DISCOVERY_BASE}/pools?` +
+    `page_size=1` +
+    `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
+    `&timeframe=${timeframe}`;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return (data.data || [])[0] ?? null;
+}
+
+async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
+  if (!Array.isArray(rawPools) || rawPools.length === 0) return rawPools;
+  const volatilityTimeframe = getVolatilityTimeframe(sourceTimeframe);
+
+  // Tag primary-timeframe values on every pool before any overwrite
+  for (const pool of rawPools) {
+    if (!pool) continue;
+    pool[`volume_${sourceTimeframe}`] = pool.volume ?? null;
+    pool[`volatility_${sourceTimeframe}`] = pool.volatility ?? null;
+    pool.volatility_timeframe = volatilityTimeframe;
+  }
+
+  if (sourceTimeframe === volatilityTimeframe) return rawPools;
+
+  const uniquePoolAddresses = [...new Set(rawPools.map((pool) => pool?.pool_address).filter(Boolean))];
+  const longResults = await Promise.allSettled(
+    uniquePoolAddresses.map((poolAddress) =>
+      fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
+        .then((pool) => ({
+          poolAddress,
+          volatility: numeric(pool?.volatility),
+          volume: numeric(pool?.volume),
+        }))
+    )
+  );
+
+  const metricsByPool = new Map();
+  for (const result of longResults) {
+    if (result.status !== "fulfilled") continue;
+    metricsByPool.set(result.value.poolAddress, result.value);
+  }
+
+  for (const pool of rawPools) {
+    if (!pool?.pool_address) continue;
+    const metrics = metricsByPool.get(pool.pool_address);
+    if (!metrics) continue;
+
+    pool[`volume_${volatilityTimeframe}`] = metrics.volume;
+    pool[`volatility_${volatilityTimeframe}`] = metrics.volatility;
+
+    // Use longer-timeframe values as the canonical ones for filtering
+    if (metrics.volatility != null) pool.volatility = metrics.volatility;
+    if (metrics.volume != null) pool.volume = metrics.volume;
+  }
+
+  return rawPools;
 }
 
 async function searchAssetsBySymbol(symbol) {
@@ -128,9 +242,56 @@ async function searchAssetsBySymbol(symbol) {
   return Array.isArray(data) ? data : [data];
 }
 
+async function enrichDiscordSignalLaunchpads(rawPools) {
+  const missing = rawPools.filter((pool) =>
+    pool?.discord_signal &&
+    !getPoolLaunchpad(pool) &&
+    getPoolBaseMint(pool)
+  );
+  if (missing.length === 0) return;
+
+  const uniqueMints = [...new Set(missing.map(getPoolBaseMint).filter(Boolean))];
+  const results = await Promise.allSettled(
+    uniqueMints.map(async (mint) => {
+      const assets = await searchAssetsBySymbol(mint);
+      const asset = assets.find((item) => item?.id === mint) || assets[0] || null;
+      return { mint, asset };
+    })
+  );
+
+  const byMint = new Map();
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    const launchpad = result.value.asset?.launchpad || result.value.asset?.launchpadPlatform || null;
+    if (!launchpad) continue;
+    byMint.set(result.value.mint, {
+      launchpad,
+      dev: result.value.asset?.dev || null,
+      holderCount: numeric(result.value.asset?.holderCount),
+      organicScore: numeric(result.value.asset?.organicScore),
+      marketCap: numeric(result.value.asset?.mcap ?? result.value.asset?.fdv),
+      createdAt: result.value.asset?.createdAt ? Date.parse(result.value.asset.createdAt) : null,
+    });
+  }
+
+  for (const pool of missing) {
+    const mint = getPoolBaseMint(pool);
+    const asset = byMint.get(mint);
+    if (!asset) continue;
+    pool.token_x ||= {};
+    pool.token_x.launchpad = asset.launchpad;
+    pool.base_token_launchpad = asset.launchpad;
+    if (asset.dev && !pool.token_x.dev) pool.token_x.dev = asset.dev;
+    if (asset.holderCount != null && pool.base_token_holders == null) pool.base_token_holders = asset.holderCount;
+    if (asset.organicScore != null && pool.token_x.organic_score == null) pool.token_x.organic_score = asset.organicScore;
+    if (asset.marketCap != null && pool.token_x.market_cap == null) pool.token_x.market_cap = asset.marketCap;
+    if (asset.createdAt != null && pool.token_x.created_at == null) pool.token_x.created_at = asset.createdAt;
+    log("screening", `Discord signal launchpad enriched from Jupiter: ${pool.name || mint} — ${asset.launchpad}`);
+  }
+}
+
 async function findRivalPool(mint) {
-  const s = config.screening;
-  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${s.pvpMinActiveTvl}`)}`;
+  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`rival pool search ${res.status}`);
   const data = await res.json();
@@ -139,10 +300,9 @@ async function findRivalPool(mint) {
 }
 
 async function enrichPvpRisk(pools) {
-  const s = config.screening;
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, s.pvpShortlistLimit);
+    .slice(0, PVP_SHORTLIST_LIMIT);
 
   if (shortlist.length === 0) return;
 
@@ -162,12 +322,12 @@ async function enrichPvpRisk(pools) {
     const rivalAssets = assets
       .filter((asset) => normalizeSymbol(asset?.symbol) === symbol && asset?.id && asset.id !== ownMint)
       .sort((a, b) => Number(b?.liquidity || 0) - Number(a?.liquidity || 0))
-      .slice(0, s.pvpRivalLimit);
+      .slice(0, PVP_RIVAL_LIMIT);
 
     for (const rival of rivalAssets) {
       const rivalHolders = Number(rival?.holderCount || 0);
       const rivalFees = Number(rival?.fees || 0);
-      if (rivalHolders < s.pvpMinHolders || rivalFees < s.pvpMinGlobalFeesSol) continue;
+      if (rivalHolders < PVP_MIN_HOLDERS || rivalFees < PVP_MIN_GLOBAL_FEES_SOL) continue;
 
       const rivalPool = await findRivalPool(rival.id).catch(() => null);
       if (!rivalPool) continue;
@@ -188,6 +348,32 @@ async function enrichPvpRisk(pools) {
 }
 
 
+
+/**
+ * Refresh live metrics for discord-only signal pools.
+ * Their discovery_pool is a snapshot from when the signal was captured — volume/volatility/fee
+ * can be 0 even if the pool is active right now. We overwrite with fresh data from the
+ * pool discovery API so filtering uses current numbers, not stale ones.
+ */
+async function refreshDiscordOnlyPools(pools, timeframe) {
+  if (!pools.length) return;
+  const FIELDS = ["volume", "fee", "active_tvl", "tvl", "volatility", "fee_active_tvl_ratio"];
+  const results = await Promise.allSettled(
+    pools.map((pool) =>
+      fetchPoolDiscoveryDetail({ poolAddress: pool.pool_address, timeframe })
+        .then((fresh) => ({ pool, fresh }))
+    )
+  );
+  for (const result of results) {
+    if (result.status !== "fulfilled" || !result.value.fresh) continue;
+    const { pool, fresh } = result.value;
+    for (const field of FIELDS) {
+      const val = numeric(fresh[field]);
+      if (val != null) pool[field] = val;
+    }
+    log("screening", `Discord signal refreshed live data: ${pool.name || pool.pool_address} — vol=${pool.volume?.toFixed(0)} fee=${pool.fee?.toFixed(2)}`);
+  }
+}
 
 /**
  * Fetch pools from the Meteora Pool Discovery API.
@@ -222,30 +408,12 @@ export async function discoverPools({
       : null,
   ].filter(Boolean).join("&&");
 
-  const useServerDiscovery = !!config.api.publicApiKey;
-  const url = useServerDiscovery
-    ? `${config.api.url}/discovery/pools?` +
-      `page_size=${page_size}` +
-      `&filter_by=${encodeURIComponent(filters)}` +
-      `&timeframe=${s.timeframe}` +
-      `&category=${s.category}`
-    : `${POOL_DISCOVERY_BASE}/pools?` +
-      `page_size=${page_size}` +
-      `&filter_by=${encodeURIComponent(filters)}` +
-      `&timeframe=${s.timeframe}` +
-      `&category=${s.category}`;
-
-  const res = await fetch(url, {
-    headers: useServerDiscovery && config.api.publicApiKey
-      ? { "x-api-key": config.api.publicApiKey }
-      : {},
+  const data = await fetchPoolDiscoveryPage({
+    page_size,
+    filters,
+    timeframe: s.timeframe,
+    category: s.category,
   });
-
-  if (!res.ok) {
-    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
 
   let rawPools = Array.isArray(data.data) ? data.data : [];
 
@@ -271,8 +439,11 @@ export async function discoverPools({
 
     if (config.screening.discordSignalMode === "only") {
       rawPools = signalPools;
+      // Refresh all signal pools with live data since discovery_pool is a stale snapshot
+      await refreshDiscordOnlyPools(rawPools, s.timeframe);
     } else if (signalPools.length > 0) {
       const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+      const discordOnlyPools = [];
       for (const signalPool of signalPools) {
         if (byPool.has(signalPool.pool_address)) {
           byPool.set(signalPool.pool_address, {
@@ -285,11 +456,20 @@ export async function discoverPools({
           });
         } else {
           byPool.set(signalPool.pool_address, signalPool);
+          discordOnlyPools.push(signalPool);
         }
       }
       rawPools = Array.from(byPool.values());
+      // Refresh discord-only pools with live data — their discovery_pool is a stale snapshot
+      // so volume/volatility/fee may be 0 even when the pool is active right now
+      if (discordOnlyPools.length > 0) {
+        await refreshDiscordOnlyPools(discordOnlyPools, s.timeframe);
+      }
     }
   }
+
+  rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
+  await enrichDiscordSignalLaunchpads(rawPools);
 
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
@@ -364,44 +544,16 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit } = {}) {
   const { config } = await import("../config.js");
-  limit = limit ?? config.screening.candidateLimit ?? 10;
-  const source = String(config.screening.source || "meteora").toLowerCase();
-  if (!["meteora", "gmgn"].includes(source)) {
-    throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
-  }
-  const discovery = source === "gmgn"
-    ? await discoverGmgnPools({ limit: Math.max(limit, config.gmgn.enrichLimit || 20) })
-    : await discoverPools({ page_size: 50 });
-  let { pools } = discovery;
+  const discovery = await discoverPools({ page_size: 50 });
+  const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
-
-  // Token blacklist + dev blocklist (Meteora path runs these inside discoverPools; GMGN path does not)
-  if (source === "gmgn") {
-    const before = pools.length;
-    pools = pools.filter((p) => {
-      if (isBlacklisted(p.base?.mint)) {
-        log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
-        pushFilteredReason(filteredOut, p, "blacklisted token");
-        return false;
-      }
-      if (p.dev && isDevBlocked(p.dev)) {
-        log("dev_blocklist", `Filtered blocked deployer ${p.dev?.slice(0, 8)} token ${p.base?.symbol}`);
-        pushFilteredReason(filteredOut, p, "blocked deployer");
-        return false;
-      }
-      return true;
-    });
-    if (pools.length < before) log("blacklist", `GMGN: filtered ${before - pools.length} blacklisted/blocked pool(s)`);
-  }
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
   const { positions } = await getMyPositions();
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = source === "gmgn"
-    ? Number(config.gmgn.minTvl ?? config.screening.minTvl ?? 0)
-    : Number(config.screening.minTvl ?? 0);
+  const minTvl = Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
 
@@ -462,8 +614,7 @@ export async function getTopCandidates({ limit } = {}) {
   }
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
-  // Skipped for GMGN: bundler/bot/wash data already sourced from GMGN pipeline
-  if (source !== "gmgn" && eligible.length > 0) {
+  if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
     const okxResults = await Promise.allSettled(
       eligible.map(async (p) => {
@@ -601,11 +752,8 @@ export async function getTopCandidates({ limit } = {}) {
 
   return {
     candidates: eligible,
-    total_screened: discovery.total ?? pools.length,
-    source,
+    total_screened: pools.length,
     filtered_examples: filteredOut.slice(0, 3),
-    stage_counts: discovery.stage_counts ? { ranked: discovery.total, ...discovery.stage_counts } : null,
-    all_filtered: filteredOut,
   };
 }
 
@@ -614,29 +762,8 @@ export async function getTopCandidates({ limit } = {}) {
  * Fetches top 50 pools from discovery API and finds the matching address.
  * Returns the full unfiltered API object (all fields, not condensed).
  */
-export async function getPoolDetail({ pool_address, timeframe }) {
-  const useServerDiscovery = !!config.api.publicApiKey;
-  timeframe = timeframe || config.screening.timeframe || "5m";
-
-  const url = useServerDiscovery
-    ? `${config.api.url}/discovery/pools/${pool_address}?timeframe=${encodeURIComponent(timeframe)}`
-    : `${POOL_DISCOVERY_BASE}/pools?` +
-      `page_size=1` +
-      `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
-      `&timeframe=${timeframe}`;
-
-  const res = await fetch(url, {
-    headers: useServerDiscovery && config.api.publicApiKey
-      ? { "x-api-key": config.api.publicApiKey }
-      : {},
-  });
-
-  if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
-  const pool = useServerDiscovery ? data : (data.data || [])[0];
+export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
+  const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe });
 
   if (!pool) {
     throw new Error(`Pool ${pool_address} not found`);
@@ -673,8 +800,16 @@ function condensePool(p) {
     fee_window: round(p.fee),
     volume_window: round(p.volume),
     fee_active_tvl_ratio: p.fee_active_tvl_ratio != null ? fix(p.fee_active_tvl_ratio, 4) : null,
-    volatility: fix(p.volatility, 2),
+    volatility: fix(p.volatility, 4),
+    volatility_timeframe: p.volatility_timeframe || getVolatilityTimeframe(config.screening.timeframe),
 
+    // Per-timeframe breakdown (populated when sourceTimeframe !== volatilityTimeframe)
+    ...(p.volatility_timeframe && p.volatility_timeframe !== config.screening.timeframe ? {
+      [`volume_${config.screening.timeframe}`]: round(p[`volume_${config.screening.timeframe}`] ?? null),
+      [`volume_${p.volatility_timeframe}`]: round(p[`volume_${p.volatility_timeframe}`] ?? null),
+      [`volatility_${config.screening.timeframe}`]: fix(p[`volatility_${config.screening.timeframe}`] ?? null, 4),
+      [`volatility_${p.volatility_timeframe}`]: fix(p[`volatility_${p.volatility_timeframe}`] ?? null, 4),
+    } : {}),
 
     // Token health
     holders: p.base_token_holders,
@@ -684,6 +819,7 @@ function condensePool(p) {
       ? Math.floor((Date.now() - p.token_x.created_at) / 3_600_000)
       : null,
     dev: p.token_x?.dev || null,
+    launchpad: getPoolLaunchpad(p),
 
     // Position health
     active_positions: p.active_positions,
@@ -714,8 +850,8 @@ function round(n) {
 }
 
 function fix(n, decimals) {
-  const value = numeric(n);
-  return value != null ? Number(value.toFixed(decimals)) : null;
+  const value = Number(n);
+  return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
 }
 
 function pushFilteredReason(list, pool, reason) {
@@ -723,7 +859,5 @@ function pushFilteredReason(list, pool, reason) {
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
     reason,
-    mint: pool.base?.mint || pool.mint || null,
-    pool: pool.pool || null,
   });
 }

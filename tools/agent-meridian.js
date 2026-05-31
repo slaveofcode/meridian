@@ -15,30 +15,12 @@ export function getAgentIdForRequests() {
   return config.hiveMind.agentId || "agent-local";
 }
 
-export function shouldUseLpAgentRelay() {
-  return !!config.api.lpAgentRelayEnabled;
-}
-
-export function shouldUseLpAgentRelayForDeploy() {
-  return false;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isRetryableStatus(status) {
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
-}
-
-export function isRetryableMeridianError(error) {
-  if (isRetryableStatus(Number(error?.status || 0))) return true;
-  const name = String(error?.name || "");
-  const message = String(error?.message || "").toLowerCase();
-  return name === "AbortError" ||
-    message.includes("aborted") ||
-    message.includes("fetch failed") ||
-    message.includes("network");
 }
 
 function retryDelayMs(error, attempt) {
@@ -71,9 +53,8 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-export async function agentMeridianJsonOnce(pathname, options = {}, timeoutMs = null) {
-  const base = getAgentMeridianBase();
-  const res = await fetchWithTimeout(`${base}${pathname}`, options, timeoutMs);
+async function agentMeridianJsonOnce(pathname, options = {}, timeoutMs = null) {
+  const res = await fetchWithTimeout(`${getAgentMeridianBase()}${pathname}`, options, timeoutMs);
   const text = await res.text().catch(() => "");
   let payload = {};
   try {
@@ -114,7 +95,8 @@ export async function agentMeridianJson(pathname, options = {}) {
       );
     } catch (error) {
       lastError = error;
-      if (!isRetryableMeridianError(error) || attempt >= maxAttempts - 1) {
+      const status = Number(error?.status || 0);
+      if (!isRetryableStatus(status) || attempt >= maxAttempts - 1) {
         throw error;
       }
       const waitMs = Math.min(retryDelayMs(error, attempt), Math.max(0, remainingMs - 1));
@@ -126,9 +108,3 @@ export async function agentMeridianJson(pathname, options = {}) {
 
   throw lastError || new Error(`${pathname} retry budget exhausted`);
 }
-
-// ─── Backward-compatible aliases for callers still using old names ──────
-export const meridianJson = agentMeridianJson;
-export const meridianJsonOnce = agentMeridianJsonOnce;
-export const getMeridianHeaders = getAgentMeridianHeaders;
-export const getMeridianApiBase = getAgentMeridianBase;

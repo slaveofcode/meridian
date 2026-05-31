@@ -1,19 +1,13 @@
-#!/usr/bin/env node
 /**
  * meridian Discord listener — selfbot
+ * Watches LP Army channels for Solana addresses and runs pre-check pipeline.
+ * Uses discord.js-selfbot-v13 (personal automation, not a bot token).
  *
- * Watches LP Army channels for Solana addresses posted by Metlex Pool Bot,
- * runs pre-check pipeline (dedup → blacklist → pool → rug → deployer → fees),
- * and queues valid signals to discord-signals.json for the agent to consume.
- *
- * ⚠️ WARNING: This uses discord.js-selfbot-v13 (user account, not bot token).
- * Selfbotting violates Discord ToS and MAY result in account termination.
- * Use at your own risk — this is for research/automation only.
- *
- * Env vars (from project root .env):
+ * Env vars (from ../.env):
  *   DISCORD_USER_TOKEN     — your Discord account token (from browser DevTools)
  *   DISCORD_GUILD_ID       — LP Army server ID
  *   DISCORD_CHANNEL_IDS    — comma-separated channel IDs to monitor
+ *   DISCORD_MIN_FEES_SOL   — minimum pool fees threshold (default: 5)
  */
 import { Client } from "discord.js-selfbot-v13";
 import fs from "fs";
@@ -21,6 +15,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 
+// Load .env from parent directory (meridian root)
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const require = createRequire(import.meta.url);
@@ -42,7 +37,8 @@ const FALSE_POSITIVE_SKIP = new Set([
 function isLikelySolanaAddress(str) {
   if (str.length < 32 || str.length > 44) return false;
   if (FALSE_POSITIVE_SKIP.has(str.toLowerCase())) return false;
-  if (!/\d/.test(str)) return false; // must contain digits
+  // Must contain digits (pure alpha strings are usually words)
+  if (!/\d/.test(str)) return false;
   return true;
 }
 
@@ -53,7 +49,8 @@ function loadSignals() {
 
 function saveSignal(record) {
   const signals = loadSignals();
-  signals.unshift(record);
+  signals.unshift(record); // newest first
+  // Keep last 100 signals
   fs.writeFileSync(SIGNALS_FILE, JSON.stringify(signals.slice(0, 100), null, 2));
 }
 
@@ -81,9 +78,10 @@ async function processAddress(address, message) {
   saveSignal(record);
   console.log(`\n[QUEUED] ${record.base_symbol} → ${record.pool_address}`);
   console.log(`  from: @${record.discord_author} in #${record.discord_channel}`);
+  console.log(`  → Check with: node ../cli.js discord-signals`);
 }
 
-// ─── Main ────────────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 const TOKEN = process.env.DISCORD_USER_TOKEN;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
@@ -121,9 +119,12 @@ client.on("ready", () => {
 });
 
 client.on("messageCreate", async (message) => {
+  // Only process messages from configured guild + channels
   if (message.guildId !== GUILD_ID) return;
   if (!CHANNEL_IDS.includes(message.channelId)) return;
+  // Skip own messages
   if (message.author?.id === client.user?.id) return;
+  // Only process messages from Metlex Pool Bot
   if (message.author?.username !== "Metlex Pool Bot") return;
 
   const content = message.content || "";
@@ -138,6 +139,7 @@ client.on("messageCreate", async (message) => {
   console.log(`\n[message] @${message.author?.username} in #${message.channel?.name}: "${content.slice(0, 80)}"`);
   console.log(`  Addresses found: ${unique.join(", ")}`);
 
+  // Process each address independently (don't await — handle concurrently but logged sequentially)
   for (const addr of unique) {
     await processAddress(addr, message);
   }

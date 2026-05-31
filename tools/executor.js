@@ -29,7 +29,6 @@ import { execSync, spawn } from "child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
-const GMGN_CONFIG_PATH = path.join(__dirname, "../gmgn-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
@@ -44,23 +43,6 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
-
-const SENSITIVE_CONFIG_KEYS = new Set([
-  "gmgnApiKey",
-  "hiveMindApiKey",
-  "publicApiKey",
-]);
-
-function redactConfigValue(key, value) {
-  if (!SENSITIVE_CONFIG_KEYS.has(key)) return value;
-  return typeof value === "string" && value ? "***redacted***" : value;
-}
-
-function redactAppliedConfig(applied) {
-  return Object.fromEntries(
-    Object.entries(applied || {}).map(([key, value]) => [key, redactConfigValue(key, value)]),
-  );
-}
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -89,6 +71,107 @@ function poolDetailFeeActiveTvlRatio(pool) {
 function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
+
+async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
+  const encodedTimeframe = encodeURIComponent(timeframe);
+  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
+  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  return (data?.data || [])[0] ?? null;
+}
+
+async function validateDeployPoolThresholds(args) {
+  let detail;
+  try {
+    detail = await fetchFreshPoolDetail(args.pool_address);
+    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+  } catch (error) {
+    return {
+      pass: false,
+      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+    };
+  }
+
+  const tvl = poolDetailTvl(detail);
+  const minTvl = numberOrNull(config.screening.minTvl);
+  const maxTvl = numberOrNull(config.screening.maxTvl);
+  if (tvl == null) {
+    return {
+      pass: false,
+      reason: "Could not verify pool TVL before deploy.",
+    };
+  }
+  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
+    return {
+      pass: false,
+      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
+    };
+  }
+  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+    return {
+      pass: false,
+      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
+    };
+  }
+
+  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
+  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
+  if (
+    minFeeActiveTvlRatio != null &&
+    minFeeActiveTvlRatio > 0 &&
+    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
+  ) {
+    return {
+      pass: false,
+      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+    };
+  }
+
+  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
+  let volatilityDetail = detail;
+  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+    try {
+      volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
+    } catch (error) {
+      return {
+        pass: false,
+        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
+      };
+    }
+  }
+
+  const volatility = poolDetailVolatility(volatilityDetail);
+  if (volatility == null || volatility <= 0) {
+    return {
+      pass: false,
+      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+    };
+  }
+
+  const actualBinStep = poolDetailBinStep(detail);
+  const minStep = numberOrNull(config.screening.minBinStep);
+  const maxStep = numberOrNull(config.screening.maxBinStep);
+  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
+    return {
+      pass: false,
+      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
+    };
+  }
+  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
+    return {
+      pass: false,
+      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
+    };
+  }
+
+  return { pass: true };
+}
+
+// Registered by index.js so update_config can restart cron jobs when intervals change
+let _cronRestarter = null;
+export function registerCronRestarter(fn) { _cronRestarter = fn; }
 
 function coerceBoolean(value, key) {
   if (typeof value === "boolean") return value;
@@ -151,107 +234,6 @@ function normalizeConfigValue(key, value) {
   return coerceFiniteNumber(value, key);
 }
 
-async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
-  const encodedTimeframe = encodeURIComponent(timeframe);
-  const filter = encodeURIComponent(`pool_address=${poolAddress}`);
-  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodedTimeframe}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  const data = await res.json();
-  return (data?.data || [])[0] ?? null;
-}
-
-async function validateDeployPoolThresholds(args) {
-  let detail;
-  try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
-  } catch (error) {
-    return {
-      pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
-    };
-  }
-
-  const tvl = poolDetailTvl(detail);
-  const minTvl = numberOrNull(config.screening.minTvl);
-  const maxTvl = numberOrNull(config.screening.maxTvl);
-  if (tvl == null) {
-    return {
-      pass: false,
-      reason: "Could not verify pool TVL before deploy.",
-    };
-  }
-  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
-    };
-  }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
-    };
-  }
-
-  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
-  const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
-  if (
-    minFeeActiveTvlRatio != null &&
-    minFeeActiveTvlRatio > 0 &&
-    (feeActiveTvlRatio == null || feeActiveTvlRatio < minFeeActiveTvlRatio)
-  ) {
-    return {
-      pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
-    };
-  }
-
-  const actualBinStep = poolDetailBinStep(detail);
-  const minStep = numberOrNull(config.screening.minBinStep);
-  const maxStep = numberOrNull(config.screening.maxBinStep);
-  if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is below configured minBinStep ${minStep}.`,
-    };
-  }
-  if (actualBinStep != null && maxStep != null && actualBinStep > maxStep) {
-    return {
-      pass: false,
-      reason: `Pool bin_step ${actualBinStep} is above configured maxBinStep ${maxStep}.`,
-    };
-  }
-
-  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
-  let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
-    try {
-      volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
-    } catch (error) {
-      return {
-        pass: false,
-        reason: `Could not verify pool ${volatilityTimeframe} volatility before deploy: ${error.message}`,
-      };
-    }
-  }
-
-  const volatility = poolDetailVolatility(volatilityDetail);
-  if (volatility == null || volatility <= 0) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
-  }
-
-  return { pass: true };
-}
-
-// Registered by index.js so update_config can restart cron jobs when intervals change
-let _cronRestarter = null;
-export function registerCronRestarter(fn) { _cronRestarter = fn; }
-
 // Map tool names to implementations
 const toolMap = {
   discover_pools: discoverPools,
@@ -289,15 +271,20 @@ const toolMap = {
       }
       // Delay restart so this tool response (and Telegram message) gets sent first
       setTimeout(() => {
-        const child = spawn(process.execPath, process.argv.slice(1), {
-          detached: true,
-          stdio: "inherit",
-          cwd: process.cwd(),
-        });
-        child.unref();
+        if (!process.env.pm_id) {
+          const child = spawn(process.execPath, process.argv.slice(1), {
+            detached: true,
+            stdio: "inherit",
+            cwd: process.cwd(),
+          });
+          child.unref();
+        }
         process.exit(0);
       }, 3000);
-      return { success: true, updated: true, message: `Updated! Restarting in 3s...\n${result}` };
+      const restartMode = process.env.pm_id
+        ? "PM2 detected — exiting in 3s so PM2 can restart the managed process."
+        : "Restarting in 3s...";
+      return { success: true, updated: true, message: `Updated! ${restartMode}\n${result}` };
     } catch (e) {
       return { success: false, error: e.message };
     }
@@ -375,14 +362,6 @@ const toolMap = {
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
-      maxVolatility:     ["screening", "maxVolatility"],
-      pvpMinActiveTvl:   ["screening", "pvpMinActiveTvl"],
-      pvpMinHolders:     ["screening", "pvpMinHolders"],
-      pvpMinGlobalFeesSol: ["screening", "pvpMinGlobalFeesSol"],
-      pvpShortlistLimit: ["screening", "pvpShortlistLimit"],
-      pvpRivalLimit:     ["screening", "pvpRivalLimit"],
-      candidateLimit:    ["screening", "candidateLimit"],
-      pageSize:          ["screening", "pageSize"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
@@ -404,9 +383,6 @@ const toolMap = {
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
-      rapidDropEnabled: ["management", "rapidDropEnabled"],
-      rapidDropPct: ["management", "rapidDropPct"],
-      rapidDropCooldownSec: ["management", "rapidDropCooldownSec"],
       solMode: ["management", "solMode"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
@@ -420,8 +396,6 @@ const toolMap = {
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
       healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
-      fastManagementIntervalMin: ["schedule", "fastManagementIntervalMin"],
-      fastPnlCooldownSec: ["schedule", "fastPnlCooldownSec"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],
@@ -430,8 +404,8 @@ const toolMap = {
       maxTokens: ["llm", "maxTokens"],
       maxSteps: ["llm", "maxSteps"],
       // strategy
-      strategy:     ["strategy", "strategy"],
-      binsBelow:    ["strategy", "maxBinsBelow", ["maxBinsBelow"]],
+      strategy: ["strategy", "strategy"],
+      binsBelow: ["strategy", "maxBinsBelow", ["maxBinsBelow"]],
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
@@ -444,54 +418,6 @@ const toolMap = {
       publicApiKey: ["api", "publicApiKey"],
       agentMeridianApiUrl: ["api", "url"],
       lpAgentRelayEnabled: ["api", "lpAgentRelayEnabled"],
-      // GMGN screening
-      gmgnApiKey: ["gmgn", "apiKey"],
-      gmgnBaseUrl: ["gmgn", "baseUrl"],
-      gmgnInterval: ["gmgn", "interval"],
-      gmgnOrderBy: ["gmgn", "orderBy"],
-      gmgnDirection: ["gmgn", "direction"],
-      gmgnLimit: ["gmgn", "limit"],
-      gmgnEnrichLimit: ["gmgn", "enrichLimit"],
-      gmgnRequestDelayMs: ["gmgn", "requestDelayMs"],
-      gmgnMaxRetries: ["gmgn", "maxRetries"],
-      gmgnHoldersLimit: ["gmgn", "holdersLimit"],
-      gmgnKlineResolution: ["gmgn", "klineResolution"],
-      gmgnKlineLookbackMinutes: ["gmgn", "klineLookbackMinutes"],
-      gmgnFilters: ["gmgn", "filters"],
-      gmgnPlatforms: ["gmgn", "platforms"],
-      gmgnMinMcap: ["gmgn", "minMcap"],
-      gmgnMaxMcap: ["gmgn", "maxMcap"],
-      gmgnMinVolume: ["gmgn", "minVolume"],
-      gmgnMinHolders: ["gmgn", "minHolders"],
-      gmgnMinTokenAgeHours: ["gmgn", "minTokenAgeHours"],
-      gmgnMaxTokenAgeHours: ["gmgn", "maxTokenAgeHours"],
-      gmgnAthFilterPct: ["gmgn", "athFilterPct"],
-      gmgnMaxTop10HolderRate: ["gmgn", "maxTop10HolderRate"],
-      gmgnMaxBundlerRate: ["gmgn", "maxBundlerRate"],
-      gmgnMaxRatTraderRate: ["gmgn", "maxRatTraderRate"],
-      gmgnMaxFreshWalletRate: ["gmgn", "maxFreshWalletRate"],
-      gmgnMaxDevTeamHoldRate: ["gmgn", "maxDevTeamHoldRate"],
-      gmgnMaxBotDegenRate: ["gmgn", "maxBotDegenRate"],
-      gmgnMaxSniperCount: ["gmgn", "maxSniperCount"],
-      gmgnMaxSniperHoldRate: ["gmgn", "maxSniperHoldRate"],
-      gmgnPreferredKolNames: ["gmgn", "preferredKolNames"],
-      gmgnPreferredKolMinHoldPct: ["gmgn", "preferredKolMinHoldPct"],
-      gmgnDumpKolNames: ["gmgn", "dumpKolNames"],
-      gmgnDumpKolMinHoldPct: ["gmgn", "dumpKolMinHoldPct"],
-      gmgnRequireKol: ["gmgn", "requireKol"],
-      gmgnMinKolCount: ["gmgn", "minKolCount"],
-      gmgnMinSmartDegenCount: ["gmgn", "minSmartDegenCount"],
-      gmgnMinTotalFeeSol: ["gmgn", "minTotalFeeSol"],
-      gmgnRejectSingleVolumeSpike: ["gmgn", "rejectSingleVolumeSpike"],
-      gmgnMaxSingleCandleVolumeShare: ["gmgn", "maxSingleCandleVolumeShare"],
-      gmgnIndicatorFilter: ["gmgn", "indicatorFilter"],
-      gmgnIndicatorInterval: ["gmgn", "indicatorInterval"],
-      gmgnRequireBullishSt: ["gmgn", "indicatorRules", "requireBullishSupertrend"],
-      gmgnRejectAtBottom: ["gmgn", "indicatorRules", "rejectAlreadyAtBottom"],
-      gmgnRequireAboveSt: ["gmgn", "indicatorRules", "requireAboveSupertrend"],
-      gmgnMinRsi: ["gmgn", "indicatorRules", "minRsi"],
-      gmgnMaxRsi: ["gmgn", "indicatorRules", "maxRsi"],
-      gmgnRequireBbPosition: ["gmgn", "indicatorRules", "requireBbPosition"],
       // chart indicators
       chartIndicatorsEnabled: ["indicators", "enabled", ["chartIndicators", "enabled"]],
       indicatorEntryPreset: ["indicators", "entryPreset", ["chartIndicators", "entryPreset"]],
@@ -511,6 +437,10 @@ const toolMap = {
     const CONFIG_MAP_LOWER = Object.fromEntries(
       Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
     );
+
+    if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+      return { success: false, error: "changes must be an object", reason };
+    }
 
     const STRATEGY_BIN_KEYS = new Set(["binsBelow", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow"]);
     for (const [key, val] of Object.entries(changes)) {
@@ -538,7 +468,16 @@ const toolMap = {
       return { success: false, unknown, reason };
     }
 
-    // Apply to live config immediately
+    let userConfig = {};
+    if (fs.existsSync(USER_CONFIG_PATH)) {
+      try {
+        userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+      } catch (error) {
+        return { success: false, error: `Invalid user-config.json: ${error.message}`, reason };
+      }
+    }
+
+    // Apply to live config immediately after the persisted config is known-good.
     for (const [key, val] of Object.entries(applied)) {
       const [section, field, third] = CONFIG_MAP[key];
       const isNestedField = typeof third === "string"; // string = nested subfield, array = persistPath
@@ -553,32 +492,25 @@ const toolMap = {
         log("config", `update_config: config.${section}.${field} ${redactConfigValue(key, before)} → ${redactConfigValue(key, val)} (verify: ${redactConfigValue(key, config[section][field])})`);
       }
     }
+    if (
+      applied.binsBelow != null ||
+      applied.minBinsBelow != null ||
+      applied.maxBinsBelow != null ||
+      applied.defaultBinsBelow != null
+    ) {
+      config.strategy.minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW)));
+      config.strategy.maxBinsBelow = Math.max(config.strategy.minBinsBelow, Math.round(Number(config.strategy.maxBinsBelow ?? config.strategy.minBinsBelow)));
+      config.strategy.defaultBinsBelow = Math.max(
+        config.strategy.minBinsBelow,
+        Math.min(
+          config.strategy.maxBinsBelow,
+          Math.round(Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow)),
+        ),
+      );
+    }
 
-    // Persist GMGN tuning to gmgn-config.json, and everything else to user-config.json.
-    let userConfig = {};
-    if (fs.existsSync(USER_CONFIG_PATH)) {
-      try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
-    }
-    let gmgnConfig = {};
-    if (fs.existsSync(GMGN_CONFIG_PATH)) {
-      try { gmgnConfig = JSON.parse(fs.readFileSync(GMGN_CONFIG_PATH, "utf8")); } catch { /**/ }
-    }
-    let wroteUserConfig = false;
-    let wroteGmgnConfig = false;
     for (const [key, val] of Object.entries(applied)) {
-      const [section, field, third] = CONFIG_MAP[key] || [];
-      const persistPath = Array.isArray(third) ? third : null;
-      const nestedField = typeof third === "string" ? third : null;
-      if (section === "gmgn") {
-        if (nestedField) {
-          if (!gmgnConfig[field] || typeof gmgnConfig[field] !== "object") gmgnConfig[field] = {};
-          gmgnConfig[field][nestedField] = val;
-        } else {
-          gmgnConfig[field] = val;
-        }
-        wroteGmgnConfig = true;
-        continue;
-      }
+      const persistPath = CONFIG_MAP[key]?.[2];
       if (Array.isArray(persistPath) && persistPath.length > 0) {
         let target = userConfig;
         for (const part of persistPath.slice(0, -1)) {
@@ -591,17 +523,9 @@ const toolMap = {
       } else {
         userConfig[key] = val;
       }
-      wroteUserConfig = true;
     }
-    const tunedAt = new Date().toISOString();
-    if (wroteUserConfig) {
-      userConfig._lastAgentTune = tunedAt;
-      fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
-    }
-    if (wroteGmgnConfig) {
-      gmgnConfig._lastAgentTune = tunedAt;
-      fs.writeFileSync(GMGN_CONFIG_PATH, JSON.stringify(gmgnConfig, null, 2));
-    }
+    userConfig._lastAgentTune = new Date().toISOString();
+    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
@@ -610,9 +534,7 @@ const toolMap = {
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
-    // Save as a lesson — but skip ephemeral per-deploy interval changes
-    // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
-    //  the rule is already in the system prompt, storing it 75+ times is pure noise)
+    // Skip repeated volatility-driven interval changes; they are operational tuning, not reusable lessons.
     const lessonsKeys = Object.keys(applied).filter(
       k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
@@ -763,15 +685,62 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Reject tiny-range deploys
-      const binsBelow = args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
-      const binsAbove = args.bins_above ?? 0;
-      const totalBins = Number(binsBelow) + Number(binsAbove);
-      const minBins = Math.max(MIN_SAFE_BINS_BELOW, config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW);
-      if (Number.isFinite(totalBins) && totalBins < minBins) {
+      const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
+      const deployAmountX = Number(args.amount_x ?? 0);
+      if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
         return {
           pass: false,
-          reason: `Total bins ${totalBins} below minimum ${minBins}. Refusing 1-bin/tiny-range deploy.`,
+          reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
+        };
+      }
+      const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
+      const requestedBinsAbove = Number(args.bins_above ?? 0);
+      const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
+      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
+      const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
+      if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
+        return {
+          pass: false,
+          reason: `volatility ${args.volatility} is invalid. Refusing deploy because the volatility feed is unusable.`,
+        };
+      }
+      if (
+        args.downside_pct == null &&
+        args.upside_pct == null &&
+        (
+          !Number.isFinite(requestedBinsBelow) ||
+          !Number.isFinite(requestedBinsAbove) ||
+          !Number.isInteger(requestedBinsBelow) ||
+          !Number.isInteger(requestedBinsAbove) ||
+          requestedBinsBelow < 0 ||
+          requestedBinsAbove < 0 ||
+          requestedTotalBins < minBinsBelow
+        )
+      ) {
+        return {
+          pass: false,
+          reason: `deploy range ${requestedTotalBins} total bins is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+        };
+      }
+      if (
+        isSingleSidedSol &&
+        args.downside_pct == null &&
+        (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
+      ) {
+        return {
+          pass: false,
+          reason: `bins_below ${args.bins_below ?? "missing"} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
+        };
+      }
+      if (
+        isSingleSidedSol &&
+        args.upside_pct == null &&
+        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+      ) {
+        return {
+          pass: false,
+          reason: "Single-side SOL deploy must use bins_above=0.",
         };
       }
 
@@ -807,21 +776,8 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check amount limits
-      const amountY = Number(args.amount_y ?? args.amount_sol ?? 0);
-      const amountX = Number(args.amount_x ?? 0);
-      if (!Number.isFinite(amountY)) {
-        return {
-          pass: false,
-          reason: `Invalid amount_y: ${args.amount_y}. Must be a valid number.`,
-        };
-      }
-      if (amountX > 0) {
-        return {
-          pass: false,
-          reason: `amount_x=${amountX} is not supported. Single-side SOL deploys only (amount_y only).`,
-        };
-      }
-      if (amountY <= 0) {
+      const amountY = deployAmountY;
+      if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
           reason: `Must provide a positive SOL amount (amount_y).`,

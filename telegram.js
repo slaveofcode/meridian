@@ -29,7 +29,9 @@ function loadChatId() {
       const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
       if (cfg.telegramChatId) chatId = cfg.telegramChatId;
     }
-  } catch { /**/ }
+  } catch (error) {
+    log("telegram_warn", `Invalid user-config.json; chatId not loaded: ${error.message}`);
+  }
 }
 
 function saveChatId(id) {
@@ -123,7 +125,7 @@ async function postTelegramRaw(method, body) {
 
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096), parse_mode: "Markdown" });
+  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
@@ -139,38 +141,11 @@ export async function sendHTML(html) {
   return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
 }
 
-const BOT_COMMANDS = [
-  { command: "main", description: "🏠 Menu utama" },
-  { command: "status", description: "👛 Wallet + positions" },
-  { command: "positions", description: "📊 Open positions" },
-  { command: "anal", description: "🔍 Analisis token (mint)" },
-  { command: "screen", description: "🔎 Quick screening candidates" },
-  { command: "candidates", description: "📋 Cached candidates" },
-  { command: "deploy", description: "📤 Deploy candidate (nomor)" },
-  { command: "close", description: "❌ Close position (nomor)" },
-  { command: "closeall", description: "⚠️ Close semua positions" },
-  { command: "set", description: "📝 Set instruction (nomor note)" },
-  { command: "pool", description: "🔎 Detail position (nomor)" },
-  { command: "config", description: "⚙️ Show runtime config" },
-  { command: "settings", description: "🎛 Settings menu" },
-  { command: "setcfg", description: "🔧 Update config (key value)" },
-  { command: "briefing", description: "📋 Morning briefing" },
-  { command: "pause", description: "⏸ Stop cron cycles" },
-  { command: "resume", description: "▶️ Start cron cycles" },
-  { command: "help", description: "📖 All commands" },
-];
-
-export async function setBotCommands() {
-  if (!TOKEN) return;
-  return postTelegram("setMyCommands", { commands: BOT_COMMANDS });
-}
-
 export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
     text: String(text).slice(0, 4096),
-    parse_mode: "Markdown",
   });
 }
 
@@ -412,10 +387,47 @@ async function poll(onMessage) {
   }
 }
 
+const BOT_COMMANDS = [
+  { command: "help",       description: "Show commands" },
+  { command: "status",     description: "Wallet + positions snapshot" },
+  { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
+  { command: "positions",  description: "List open positions" },
+  { command: "pool",       description: "Detailed info for one open position" },
+  { command: "close",      description: "Close one position by index" },
+  { command: "closeall",   description: "Close all open positions" },
+  { command: "set",        description: "Set note/instruction on position" },
+  { command: "config",     description: "Show important runtime config" },
+  { command: "settings",   description: "Button menu for common config" },
+  { command: "setcfg",     description: "Update persisted config key" },
+  { command: "screen",     description: "Refresh deterministic candidate list" },
+  { command: "candidates", description: "Show latest cached candidates" },
+  { command: "deploy",     description: "Deploy candidate by cached index" },
+  { command: "briefing",   description: "Morning briefing" },
+  { command: "hive",       description: "HiveMind sync status" },
+  { command: "pause",      description: "Stop cron cycles" },
+  { command: "resume",     description: "Start cron cycles again" },
+  { command: "stop",       description: "Shut down agent" },
+];
+
+async function registerCommands() {
+  if (!BASE) return;
+  try {
+    await fetch(`${BASE}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+    log("telegram", "Bot commands registered");
+  } catch (e) {
+    log("telegram_warn", `Failed to register bot commands: ${e.message}`);
+  }
+}
+
 export function startPolling(onMessage) {
   if (!TOKEN) return;
   _polling = true;
   poll(onMessage); // fire-and-forget
+  registerCommands();
   log("telegram", "Bot polling started");
 }
 

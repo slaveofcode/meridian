@@ -31,16 +31,15 @@ logs/
 
 # Dev context
 context.md
+CONTEXT.md
+dev-blocklist.json
 docs/
 
-# GMGN keys
-*.pem
+# Discord listener queue
+discord-signals.json
 
-# Test files
-test-*.js
-node_modules/
-data/
-*.tmp
+# Playwright MCP browser logs
+.playwright-mcp/
 
-AGENTS.md
-.claude/
+# Claude Code runtime lock
+.claude/scheduled_tasks.lock
