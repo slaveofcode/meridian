@@ -153,7 +153,7 @@ export async function recordPerformance(perf) {
 
   save(data);
   if (lesson) {
-    void pushHiveLesson(lesson);
+    // Push disabled — receive-only mode (data stays local)
   }
 
   // Update pool-level memory
@@ -196,12 +196,13 @@ export async function recordPerformance(perf) {
     }
   }
 
-  void pushHivePerformanceEvent({
+  // Push disabled — receive-only mode (data stays local)
+  /* void pushHivePerformanceEvent({
     ...entry,
     base_mint: perf.base_mint || null,
     fees_earned_sol: perf.fees_earned_sol || 0,
     eventId: `close:${perf.position}:${entry.recorded_at}`,
-  });
+  }); */
 
 }
 
@@ -513,7 +514,8 @@ export function addLesson(rule, tags = [], { pinned = false, role = null } = {})
   data.lessons.push(lesson);
   save(data);
   log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${safeRule}`);
-  void pushHiveLesson(lesson);
+  // Push disabled — receive-only mode (data stays local)
+  // void pushHiveLesson(lesson);
 }
 
 /**
